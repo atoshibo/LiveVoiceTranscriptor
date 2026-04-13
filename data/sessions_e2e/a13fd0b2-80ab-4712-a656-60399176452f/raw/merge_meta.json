@@ -1,0 +1,20 @@
+{
+  "success": true,
+  "output_path": "C:\\Users\\akova\\OneDrive\\Documents\\DevOurs\\LiveVoiceTranscriptor\\data\\sessions_e2e\\a13fd0b2-80ab-4712-a656-60399176452f\\raw\\audio.wav",
+  "sample_rate": 16000,
+  "channels": 1,
+  "sample_width": 2,
+  "total_frames": 16000,
+  "total_duration_ms": 1000,
+  "chunk_count": 1,
+  "chunks": [
+    {
+      "index": 0,
+      "path": "chunk_0000.wav",
+      "offset_ms": 0,
+      "duration_ms": 1000,
+      "frames": 16000,
+      "skipped": false
+    }
+  ]
+}

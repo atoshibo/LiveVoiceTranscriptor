@@ -1,0 +1,15 @@
+{
+  "job_type": "v2_canonical",
+  "session_id": "b2335b60-62fd-4476-b1a2-74079fb2a3d8",
+  "language": "auto",
+  "allowed_languages": [],
+  "forced_language": null,
+  "transcription_mode": "verbatim_multilingual",
+  "model_size": "auto",
+  "model_id": null,
+  "run_diarization": false,
+  "speaker_count": null,
+  "force_transcribe_only": false,
+  "language_candidates": null,
+  "language_selection_strategy": null
+}

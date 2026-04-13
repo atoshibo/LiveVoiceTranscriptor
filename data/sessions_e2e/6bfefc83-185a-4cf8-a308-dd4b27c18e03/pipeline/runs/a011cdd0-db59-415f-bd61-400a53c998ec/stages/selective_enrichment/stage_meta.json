@@ -1,0 +1,14 @@
+{
+  "name": "selective_enrichment",
+  "status": "done",
+  "started_at": "2026-04-12T21:13:28.179512+00:00",
+  "finished_at": "2026-04-12T21:13:28.209964+00:00",
+  "error": null,
+  "artifacts": [
+    "canonical_segments.json",
+    "transcript.txt",
+    "provenance.json",
+    "final_transcript.json"
+  ],
+  "fallback": false
+}

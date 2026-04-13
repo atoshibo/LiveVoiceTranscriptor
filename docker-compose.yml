@@ -1,0 +1,71 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      target: server
+      args:
+        INSTALL_OPTIONAL_MODEL_DEPS: "true"
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8443:8443"
+    environment:
+      SESSIONS_DIR: /data/sessions
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MODELS_DIR: /models
+      TLS_CERT_FILE: /data/certs/dev-cert.pem
+      TLS_KEY_FILE: /data/certs/dev-key.pem
+      SERVER_PORT: 8443
+      TLS_ENABLED: "true"
+      TLS_AUTO_GENERATE_SELF_SIGNED: "true"
+      TLS_CERT_COMMON_NAME: localhost
+    volumes:
+      - sessions-data:/data/sessions
+      - certs-data:/data/certs
+      - ${HOST_MODELS_DIR:-./models}:/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      target: worker
+      args:
+        INSTALL_OPTIONAL_MODEL_DEPS: "true"
+    env_file:
+      - .env
+    environment:
+      SESSIONS_DIR: /data/sessions
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MODELS_DIR: /models
+      STRICT_CUDA: "false"
+      TLS_ENABLED: "false"
+    volumes:
+      - sessions-data:/data/sessions
+      - ${HOST_MODELS_DIR:-./models}:/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  sessions-data:
+  certs-data:

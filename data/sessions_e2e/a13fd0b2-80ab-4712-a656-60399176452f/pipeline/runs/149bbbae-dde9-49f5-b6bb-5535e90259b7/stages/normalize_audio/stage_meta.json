@@ -1,0 +1,13 @@
+{
+  "name": "normalize_audio",
+  "status": "done",
+  "started_at": "2026-04-12T21:14:25.117739+00:00",
+  "finished_at": "2026-04-12T21:14:25.142585+00:00",
+  "error": null,
+  "artifacts": [
+    "audio.wav",
+    "norm_meta.json",
+    "timeline.json"
+  ],
+  "fallback": false
+}

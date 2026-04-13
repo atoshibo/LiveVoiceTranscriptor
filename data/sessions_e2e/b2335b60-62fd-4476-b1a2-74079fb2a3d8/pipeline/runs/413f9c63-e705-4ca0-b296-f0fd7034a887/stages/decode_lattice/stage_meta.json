@@ -1,0 +1,12 @@
+{
+  "name": "decode_lattice",
+  "status": "done",
+  "started_at": "2026-04-12T21:13:30.000398+00:00",
+  "finished_at": "2026-04-12T21:13:30.014035+00:00",
+  "error": null,
+  "artifacts": [
+    "decode_windows.json",
+    "W000000.wav"
+  ],
+  "fallback": false
+}

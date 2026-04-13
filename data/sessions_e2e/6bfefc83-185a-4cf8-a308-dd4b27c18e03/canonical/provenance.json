@@ -1,0 +1,32 @@
+{
+  "session_id": "6bfefc83-185a-4cf8-a308-dd4b27c18e03",
+  "segment_count": 0,
+  "assembly_method": "canonical_stripe_reconciliation",
+  "final_transcript_source": "stabilized_canonical_segments",
+  "stripe_decisions": [
+    {
+      "stripe_id": "S0000",
+      "start_ms": 0,
+      "end_ms": 1000,
+      "chosen_text": "",
+      "chosen_source": "none",
+      "confidence": 0.0,
+      "method": "fallback",
+      "fallback_reason": "all_empty",
+      "raw_llm_response": null,
+      "elapsed_s": 0.0,
+      "support_windows": [
+        "W000000"
+      ],
+      "support_models": [
+        "faster-whisper:large-v3"
+      ],
+      "language": null,
+      "support_window_count": 1,
+      "support_model_count": 1,
+      "evidence_count": 1,
+      "stabilization_state": "provisional"
+    }
+  ],
+  "segments": []
+}

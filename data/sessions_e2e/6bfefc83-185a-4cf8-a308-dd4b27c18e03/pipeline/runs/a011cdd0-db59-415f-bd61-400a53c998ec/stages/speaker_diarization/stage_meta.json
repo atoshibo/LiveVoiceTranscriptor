@@ -1,0 +1,9 @@
+{
+  "name": "speaker_diarization",
+  "status": "skipped",
+  "started_at": "2026-04-12T21:13:27.580258+00:00",
+  "finished_at": "2026-04-12T21:13:27.590592+00:00",
+  "error": "skipped: not_justified",
+  "artifacts": [],
+  "fallback": false
+}

@@ -1,0 +1,17 @@
+INFO:     127.0.0.1:65522 - "POST /api/v2/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65523 - "POST /api/v2/sessions/6bfefc83-185a-4cf8-a308-dd4b27c18e03/chunks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65524 - "POST /api/v2/sessions/6bfefc83-185a-4cf8-a308-dd4b27c18e03/finalize HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65526 - "GET /api/v2/jobs/6bfefc83-185a-4cf8-a308-dd4b27c18e03 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65527 - "GET /api/v2/jobs/6bfefc83-185a-4cf8-a308-dd4b27c18e03 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65528 - "GET /api/v2/jobs/6bfefc83-185a-4cf8-a308-dd4b27c18e03 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:65529 - "POST /api/file-upload HTTP/1.1" 200 OK
+INFO:     127.0.0.1:1024 - "POST /api/v2/sessions HTTP/1.1" 200 OK
+INFO:     127.0.0.1:1025 - "POST /api/v2/sessions/a13fd0b2-80ab-4712-a656-60399176452f/chunks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:1026 - "POST /api/v2/sessions/a13fd0b2-80ab-4712-a656-60399176452f/finalize HTTP/1.1" 200 OK
+INFO:     127.0.0.1:1028 - "GET /api/v2/jobs/a13fd0b2-80ab-4712-a656-60399176452f HTTP/1.1" 200 OK
+INFO:     127.0.0.1:1031 - "GET /api/v2/jobs/a13fd0b2-80ab-4712-a656-60399176452f HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58864 - "GET /api/v2/sessions/6bfefc83-185a-4cf8-a308-dd4b27c18e03 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58865 - "GET /api/v2/sessions/6bfefc83-185a-4cf8-a308-dd4b27c18e03/chunks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58866 - "GET /api/v2/sessions/6bfefc83-185a-4cf8-a308-dd4b27c18e03/transcript/stabilized HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58875 - "GET / HTTP/1.1" 200 OK
+INFO:     127.0.0.1:58877 - "GET /api/v2/health HTTP/1.1" 200 OK

@@ -1,0 +1,8 @@
+{
+  "session_id": "5d6aea72-1ab2-48a1-ab2f-670e69c411d0",
+  "segment_count": 0,
+  "assembly_method": "canonical_stripe_reconciliation",
+  "final_transcript_source": "stabilized_canonical_segments",
+  "stripe_decisions": [],
+  "segments": []
+}

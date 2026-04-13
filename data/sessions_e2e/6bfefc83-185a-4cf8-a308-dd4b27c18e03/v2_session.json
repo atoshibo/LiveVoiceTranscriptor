@@ -1,0 +1,49 @@
+{
+  "session_id": "6bfefc83-185a-4cf8-a308-dd4b27c18e03",
+  "version": "v2",
+  "state": "finalized",
+  "device_id": null,
+  "client_session_id": null,
+  "started_at_utc": null,
+  "sample_rate_hz": 16000,
+  "channels": 1,
+  "format": "wav",
+  "mode": "stream",
+  "source_type": null,
+  "chunk_duration_sec": null,
+  "diarization_hint": false,
+  "allowed_languages": [
+    "en",
+    "fr"
+  ],
+  "forced_language": null,
+  "transcription_mode": "verbatim_multilingual",
+  "diarization_policy": "auto",
+  "chunks": [
+    {
+      "chunk_index": 0,
+      "chunk_started_ms": 0,
+      "chunk_duration_ms": 30000,
+      "is_final": true,
+      "dropped_frames": 0,
+      "decode_failure": false,
+      "gap_before_ms": 0,
+      "source_degraded": false,
+      "file_size": 32044
+    }
+  ],
+  "created_at": "2026-04-12T21:13:26.841006+00:00",
+  "first_chunk_at": "2026-04-12T21:13:26.956714+00:00",
+  "last_chunk_at": "2026-04-12T21:13:26.956714+00:00",
+  "finalize_requested_at": "2026-04-12T21:13:27.102214+00:00",
+  "last_partial_trigger_at": null,
+  "run_diarization": false,
+  "language": "auto",
+  "model_size": "auto",
+  "model_id": null,
+  "session_integrity": null,
+  "speaker_count": null,
+  "audio_duration_s": 1.0,
+  "segment_count": 0,
+  "word_count": 0
+}

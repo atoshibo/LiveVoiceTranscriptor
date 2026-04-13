@@ -1,0 +1,11 @@
+{
+  "name": "stripe_grouping",
+  "status": "done",
+  "started_at": "2026-04-12T21:12:07.154551+00:00",
+  "finished_at": "2026-04-12T21:12:07.165635+00:00",
+  "error": null,
+  "artifacts": [
+    "stripe_packets.json"
+  ],
+  "fallback": false
+}

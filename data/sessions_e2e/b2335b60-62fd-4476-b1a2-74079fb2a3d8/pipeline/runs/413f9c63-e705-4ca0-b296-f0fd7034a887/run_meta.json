@@ -1,0 +1,162 @@
+{
+  "run_id": "413f9c63-e705-4ca0-b296-f0fd7034a887",
+  "run_type": "canonical",
+  "status": "done",
+  "stage_names": [
+    "normalize_audio",
+    "first_pass_medium",
+    "speaker_diarization",
+    "acoustic_triage",
+    "decode_lattice",
+    "candidate_asr_large_v3",
+    "candidate_asr_parakeet",
+    "stripe_grouping",
+    "reconciliation",
+    "canonical_assembly",
+    "selective_enrichment",
+    "derived_outputs"
+  ],
+  "started_at": "2026-04-12T21:13:29.703478+00:00",
+  "finished_at": "2026-04-12T21:13:30.634661+00:00",
+  "error": null,
+  "stages": {
+    "normalize_audio": {
+      "name": "normalize_audio",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:29.715419+00:00",
+      "finished_at": "2026-04-12T21:13:29.761261+00:00",
+      "error": null,
+      "artifacts": [
+        "audio.wav",
+        "norm_meta.json",
+        "timeline.json"
+      ],
+      "fallback": false
+    },
+    "first_pass_medium": {
+      "name": "first_pass_medium",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:29.779758+00:00",
+      "finished_at": "2026-04-12T21:13:29.798344+00:00",
+      "error": "fallback: provider_unavailable:No module named 'faster_whisper'",
+      "artifacts": [
+        "first_pass.json"
+      ],
+      "fallback": true
+    },
+    "speaker_diarization": {
+      "name": "speaker_diarization",
+      "status": "skipped",
+      "started_at": "2026-04-12T21:13:29.881961+00:00",
+      "finished_at": "2026-04-12T21:13:29.887878+00:00",
+      "error": "skipped: not_justified",
+      "artifacts": [],
+      "fallback": false
+    },
+    "acoustic_triage": {
+      "name": "acoustic_triage",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:29.967237+00:00",
+      "finished_at": "2026-04-12T21:13:29.987097+00:00",
+      "error": null,
+      "artifacts": [
+        "speech_map.json",
+        "speech_islands.json"
+      ],
+      "fallback": false
+    },
+    "decode_lattice": {
+      "name": "decode_lattice",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.000398+00:00",
+      "finished_at": "2026-04-12T21:13:30.014035+00:00",
+      "error": null,
+      "artifacts": [
+        "decode_windows.json",
+        "W000000.wav"
+      ],
+      "fallback": false
+    },
+    "candidate_asr_large_v3": {
+      "name": "candidate_asr_large_v3",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.021416+00:00",
+      "finished_at": "2026-04-12T21:13:30.042778+00:00",
+      "error": null,
+      "artifacts": [],
+      "fallback": false
+    },
+    "candidate_asr_parakeet": {
+      "name": "candidate_asr_parakeet",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.122913+00:00",
+      "finished_at": "2026-04-12T21:13:30.138870+00:00",
+      "error": "fallback: candidate_b_skipped_for_multilingual_session",
+      "artifacts": [
+        "candidate_b_routing.json"
+      ],
+      "fallback": true
+    },
+    "stripe_grouping": {
+      "name": "stripe_grouping",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.226155+00:00",
+      "finished_at": "2026-04-12T21:13:30.240301+00:00",
+      "error": null,
+      "artifacts": [
+        "stripe_packets.json"
+      ],
+      "fallback": false
+    },
+    "reconciliation": {
+      "name": "reconciliation",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.249580+00:00",
+      "finished_at": "2026-04-12T21:13:30.262819+00:00",
+      "error": null,
+      "artifacts": [
+        "reconciliation_result.json"
+      ],
+      "fallback": false
+    },
+    "canonical_assembly": {
+      "name": "canonical_assembly",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.326548+00:00",
+      "finished_at": "2026-04-12T21:13:30.366190+00:00",
+      "error": null,
+      "artifacts": [
+        "transcript.txt",
+        "canonical_segments.json",
+        "provenance.json",
+        "provisional_partial.json",
+        "stabilized_partial.json",
+        "final_transcript.json"
+      ],
+      "fallback": false
+    },
+    "selective_enrichment": {
+      "name": "selective_enrichment",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.379842+00:00",
+      "finished_at": "2026-04-12T21:13:30.433927+00:00",
+      "error": null,
+      "artifacts": [
+        "canonical_segments.json",
+        "transcript.txt",
+        "provenance.json",
+        "final_transcript.json"
+      ],
+      "fallback": false
+    },
+    "derived_outputs": {
+      "name": "derived_outputs",
+      "status": "done",
+      "started_at": "2026-04-12T21:13:30.525880+00:00",
+      "finished_at": "2026-04-12T21:13:30.627991+00:00",
+      "error": null,
+      "artifacts": [],
+      "fallback": false
+    }
+  }
+}

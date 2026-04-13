@@ -1,0 +1,27 @@
+# Core web framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+starlette>=0.27.0
+
+# Audio processing
+soundfile>=0.12.1
+librosa>=0.10.1
+numpy>=1.24.0
+scipy>=1.11.0
+pydub>=0.25.1
+
+# Job queue
+redis>=5.0.0
+
+# Utilities
+pyyaml>=6.0
+orjson>=3.9.0
+python-dotenv>=1.0.0
+httpx>=0.25.0
+cryptography>=42.0.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+requests>=2.31.0

@@ -1,0 +1,16 @@
+{
+  "name": "canonical_assembly",
+  "status": "done",
+  "started_at": "2026-04-12T21:13:28.122876+00:00",
+  "finished_at": "2026-04-12T21:13:28.166201+00:00",
+  "error": null,
+  "artifacts": [
+    "transcript.txt",
+    "canonical_segments.json",
+    "provenance.json",
+    "provisional_partial.json",
+    "stabilized_partial.json",
+    "final_transcript.json"
+  ],
+  "fallback": false
+}

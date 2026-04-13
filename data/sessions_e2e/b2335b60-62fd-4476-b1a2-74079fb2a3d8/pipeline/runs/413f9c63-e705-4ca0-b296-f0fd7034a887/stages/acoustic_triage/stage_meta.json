@@ -1,0 +1,12 @@
+{
+  "name": "acoustic_triage",
+  "status": "done",
+  "started_at": "2026-04-12T21:13:29.967237+00:00",
+  "finished_at": "2026-04-12T21:13:29.987097+00:00",
+  "error": null,
+  "artifacts": [
+    "speech_map.json",
+    "speech_islands.json"
+  ],
+  "fallback": false
+}

@@ -1,0 +1,13 @@
+{
+  "text": "",
+  "segments": [],
+  "detection_info": {
+    "requested_language": null,
+    "detected_language": null,
+    "language_probability": null,
+    "fallback_reason": "provider_unavailable:No module named 'faster_whisper'"
+  },
+  "selected_language": null,
+  "degraded": true,
+  "fallback_reason": "provider_unavailable:No module named 'faster_whisper'"
+}

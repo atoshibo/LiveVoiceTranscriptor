@@ -1,0 +1,18 @@
+{
+  "session_id": "a13fd0b2-80ab-4712-a656-60399176452f",
+  "language": "auto",
+  "model_size": "auto",
+  "model_id": null,
+  "run_diarization": false,
+  "speaker_count": null,
+  "force_transcribe_only": false,
+  "session_integrity": null,
+  "language_candidates": null,
+  "language_selection_strategy": null,
+  "allowed_languages": [
+    "en"
+  ],
+  "forced_language": null,
+  "transcription_mode": "verbatim",
+  "finalized_at": "2026-04-12T21:14:25.047620+00:00"
+}

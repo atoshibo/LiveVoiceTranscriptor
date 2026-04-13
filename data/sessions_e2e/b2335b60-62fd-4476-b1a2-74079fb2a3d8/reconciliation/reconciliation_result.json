@@ -1,0 +1,34 @@
+{
+  "session_id": "b2335b60-62fd-4476-b1a2-74079fb2a3d8",
+  "stripe_count": 1,
+  "llm_resolved_count": 0,
+  "fallback_resolved_count": 1,
+  "validation_rejected_count": 0,
+  "total_chosen_chars": 0,
+  "records": [
+    {
+      "stripe_id": "S0000",
+      "start_ms": 0,
+      "end_ms": 1000,
+      "chosen_text": "",
+      "chosen_source": "none",
+      "confidence": 0.0,
+      "method": "fallback",
+      "fallback_reason": "all_empty",
+      "raw_llm_response": null,
+      "elapsed_s": 0.0,
+      "support_windows": [
+        "W000000"
+      ],
+      "support_models": [
+        "faster-whisper:large-v3"
+      ],
+      "language": null,
+      "support_window_count": 1,
+      "support_model_count": 1,
+      "evidence_count": 1
+    }
+  ],
+  "reconciler_status": "llm_model_missing",
+  "llm_available": false
+}

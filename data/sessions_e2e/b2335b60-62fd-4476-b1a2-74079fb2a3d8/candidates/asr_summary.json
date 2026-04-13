@@ -1,0 +1,15 @@
+{
+  "session_id": "b2335b60-62fd-4476-b1a2-74079fb2a3d8",
+  "model_ids": [
+    "faster-whisper:large-v3"
+  ],
+  "window_count": 1,
+  "candidate_count": 1,
+  "candidates_by_model": {
+    "faster-whisper:large-v3": {
+      "count": 1,
+      "success": 0,
+      "failed": 1
+    }
+  }
+}

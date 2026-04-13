@@ -1,0 +1,11 @@
+{
+  "name": "reconciliation",
+  "status": "done",
+  "started_at": "2026-04-12T21:12:07.175898+00:00",
+  "finished_at": "2026-04-12T21:12:07.184506+00:00",
+  "error": null,
+  "artifacts": [
+    "reconciliation_result.json"
+  ],
+  "fallback": false
+}

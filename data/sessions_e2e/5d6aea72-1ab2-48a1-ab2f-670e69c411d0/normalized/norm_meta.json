@@ -1,0 +1,11 @@
+{
+  "original_sample_rate": 16000,
+  "original_channels": 1,
+  "original_samples": 16000,
+  "original_duration_ms": 1000,
+  "normalized_sample_rate": 16000,
+  "normalized_channels": 1,
+  "normalized_samples": 16000,
+  "normalized_duration_ms": 1000,
+  "success": true
+}

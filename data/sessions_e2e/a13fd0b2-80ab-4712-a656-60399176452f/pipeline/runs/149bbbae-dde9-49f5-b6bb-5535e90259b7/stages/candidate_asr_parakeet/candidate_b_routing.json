@@ -1,0 +1,12 @@
+{
+  "selected_model": null,
+  "reason": "parakeet_unavailable_for_english_session",
+  "language_context": {
+    "allowed_languages": [
+      "en"
+    ],
+    "forced_language": null,
+    "transcription_mode": "verbatim",
+    "requested_language": null
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "first_pass_medium",
+  "status": "done",
+  "started_at": "2026-04-12T21:13:29.779758+00:00",
+  "finished_at": "2026-04-12T21:13:29.798344+00:00",
+  "error": "fallback: provider_unavailable:No module named 'faster_whisper'",
+  "artifacts": [
+    "first_pass.json"
+  ],
+  "fallback": true
+}

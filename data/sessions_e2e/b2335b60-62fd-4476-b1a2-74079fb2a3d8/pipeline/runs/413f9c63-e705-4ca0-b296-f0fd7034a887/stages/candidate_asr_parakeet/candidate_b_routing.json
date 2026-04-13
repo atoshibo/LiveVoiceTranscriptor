@@ -1,0 +1,10 @@
+{
+  "selected_model": null,
+  "reason": "candidate_b_skipped_for_multilingual_session",
+  "language_context": {
+    "allowed_languages": [],
+    "forced_language": null,
+    "transcription_mode": "verbatim_multilingual",
+    "requested_language": null
+  }
+}

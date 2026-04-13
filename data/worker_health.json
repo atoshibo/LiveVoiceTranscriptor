@@ -1,0 +1,9 @@
+{
+  "gpu_available": false,
+  "gpu_name": null,
+  "gpu_reason": "torch_not_installed",
+  "worker_started_at": "2026-04-13T07:06:51.480718+00:00",
+  "selected_device": "cpu",
+  "selected_compute_type": "int8",
+  "strict_cuda": false
+}

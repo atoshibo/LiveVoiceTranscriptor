@@ -1,0 +1,11 @@
+{
+  "name": "candidate_asr_parakeet",
+  "status": "done",
+  "started_at": "2026-04-12T21:14:25.391218+00:00",
+  "finished_at": "2026-04-12T21:14:25.400178+00:00",
+  "error": "fallback: parakeet_unavailable_for_english_session",
+  "artifacts": [
+    "candidate_b_routing.json"
+  ],
+  "fallback": true
+}

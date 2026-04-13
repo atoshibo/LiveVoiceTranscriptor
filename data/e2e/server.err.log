@@ -1,0 +1,16 @@
+C:\Users\akova\OneDrive\Documents\DevOurs\LiveVoiceTranscriptor\app\main.py:104: DeprecationWarning: 
+        on_event is deprecated, use lifespan event handlers instead.
+
+        Read more about it in the
+        [FastAPI docs for Lifespan Events](https://fastapi.tiangolo.com/advanced/events/).
+        
+  @app.on_event("startup")
+INFO:     Started server process [41220]
+INFO:     Waiting for application startup.
+2026-04-12 23:13:08,800 [INFO] app.main: Sessions dir: C:\Users\akova\OneDrive\Documents\DevOurs\LiveVoiceTranscriptor\data\sessions_e2e
+2026-04-12 23:13:08,801 [INFO] app.main: Server: 127.0.0.1:8443 tls=True
+2026-04-12 23:13:08,801 [INFO] app.main: TLS ready: {'enabled': True, 'generated': False, 'cert_file': 'C:\\Users\\akova\\OneDrive\\Documents\\DevOurs\\LiveVoiceTranscriptor\\data\\certs\\e2e-cert.pem', 'key_file': 'C:\\Users\\akova\\OneDrive\\Documents\\DevOurs\\LiveVoiceTranscriptor\\data\\certs\\e2e-key.pem', 'reason': 'existing_files'}
+2026-04-12 23:13:08,880 [INFO] app.main: Redis connected: 127.0.0.1:6379
+INFO:     Application startup complete.
+INFO:     Uvicorn running on https://127.0.0.1:8443 (Press CTRL+C to quit)
+2026-04-12 23:14:25,079 [ERROR] app.api.api_v2: Failed to enqueue job: [WinError 5] Accès refusé: 'C:\\Users\\akova\\OneDrive\\Documents\\DevOurs\\LiveVoiceTranscriptor\\data\\sessions_e2e\\a13fd0b2-80ab-4712-a656-60399176452f\\.atomic_b4nuknlw.tmp' -> 'C:\\Users\\akova\\OneDrive\\Documents\\DevOurs\\LiveVoiceTranscriptor\\data\\sessions_e2e\\a13fd0b2-80ab-4712-a656-60399176452f\\status.json'

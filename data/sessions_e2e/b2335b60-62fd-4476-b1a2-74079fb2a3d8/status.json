@@ -1,0 +1,11 @@
+{
+  "status": "done",
+  "progress": {
+    "upload": 100,
+    "processing": 100,
+    "stage": "done"
+  },
+  "started_at": "2026-04-12T21:13:29.664086+00:00",
+  "partial_preview": "",
+  "finished_at": "2026-04-12T21:13:30.640832+00:00"
+}

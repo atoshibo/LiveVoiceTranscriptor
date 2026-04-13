@@ -1,0 +1,26 @@
+{
+  "candidate_id": "cand_868872c2",
+  "session_id": "a13fd0b2-80ab-4712-a656-60399176452f",
+  "model_id": "faster-whisper:large-v3",
+  "window_id": "W000000",
+  "window_start_ms": 0,
+  "window_end_ms": 1000,
+  "window_type": "full",
+  "raw_text": "",
+  "segments": [],
+  "language_evidence": {
+    "requested_language": "en",
+    "detected_language": null,
+    "language_probability": null,
+    "fallback_reason": "provider_unavailable:No module named 'faster_whisper'"
+  },
+  "confidence_features": {
+    "success": false,
+    "error": "provider_unavailable:No module named 'faster_whisper'",
+    "degraded": true
+  },
+  "decode_metadata": {
+    "model_id": "faster-whisper:large-v3",
+    "transcription_mode": "verbatim"
+  }
+}
