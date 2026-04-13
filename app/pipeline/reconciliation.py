@@ -25,6 +25,7 @@ from typing import List, Dict, Optional, Tuple
 
 from app.core.config import get_config
 from app.core.atomic_io import atomic_write_json
+from app.models.registry import DEFAULT_CANDIDATE_A, DEFAULT_CANDIDATE_B, DEFAULT_FIRST_PASS, resolve_model_id
 from app.storage.session_store import session_dir
 
 logger = logging.getLogger(__name__)
@@ -32,9 +33,9 @@ logger = logging.getLogger(__name__)
 # Candidate priority order for deterministic fallback
 # (higher priority = preferred when no LLM available)
 MODEL_PRIORITY = {
-    "faster-whisper:large-v3": 3,
-    "nemo-asr:parakeet-tdt-0.6b-v3": 2,  # Parakeet replaces turbo
-    "faster-whisper:medium": 1,
+    resolve_model_id(DEFAULT_CANDIDATE_A): 3,
+    resolve_model_id(DEFAULT_CANDIDATE_B): 2,
+    resolve_model_id(DEFAULT_FIRST_PASS): 1,
 }
 
 RECONCILIATION_PROMPT_TEMPLATE = """You are a transcript reconciliation engine. Your ONLY job is to select the best transcript text for a specific time segment.
@@ -199,7 +200,7 @@ def _select_fallback(evidence: List[Dict]) -> Dict:
     best = None
     best_score = -1
     for e in non_empty:
-        priority = MODEL_PRIORITY.get(e.get("model_id", ""), 0)
+        priority = MODEL_PRIORITY.get(resolve_model_id(e.get("model_id", "")), 0)
         trust = e.get("trust_score", 0.5)
         score = priority * trust
         if score > best_score:

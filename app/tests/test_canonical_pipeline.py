@@ -19,10 +19,9 @@ class TestCanonicalStages:
         from app.pipeline.run import CANONICAL_V1_STAGES
         expected = [
             "normalize_audio",
-            "first_pass_medium",
-            "speaker_diarization",
             "acoustic_triage",
             "decode_lattice",
+            "first_pass_medium",
             "candidate_asr_large_v3",
             "candidate_asr_parakeet",
             "stripe_grouping",
@@ -35,7 +34,7 @@ class TestCanonicalStages:
 
     def test_count(self):
         from app.pipeline.run import CANONICAL_V1_STAGES
-        assert len(CANONICAL_V1_STAGES) == 12
+        assert len(CANONICAL_V1_STAGES) == 11
 
     def test_no_turbo_in_stages(self):
         """Turbo must NOT be in the canonical stage list."""
@@ -103,6 +102,35 @@ class TestPipelineGeometry:
                     supporting.append(w)
             assert len(supporting) >= 2, f"Stripe {stripe['stripe_id']} has only {len(supporting)} supporting windows"
 
+    def test_bridge_window_required_when_speech_crosses_chunk_boundary(self):
+        from app.pipeline.decode_lattice import build_decode_windows
+
+        windows = build_decode_windows(60000, speech_islands=[
+            {"start_ms": 29000, "end_ms": 31000},
+        ])
+        bridge = next(w for w in windows if w["window_type"] == "bridge" and w["start_ms"] == 15000)
+
+        assert bridge["bridge_required"] is True
+        assert bridge["scheduled"] is True
+
+    def test_bridge_window_skipped_when_boundary_has_no_crossing_speech(self):
+        from app.pipeline.decode_lattice import build_decode_windows
+
+        windows = build_decode_windows(60000, speech_islands=[
+            {"start_ms": 0, "end_ms": 1000},
+        ])
+        bridge = next(w for w in windows if w["window_type"] == "bridge" and w["start_ms"] == 15000)
+
+        assert bridge["bridge_required"] is False
+        assert bridge["scheduled"] is False
+
+    def test_decode_windows_stay_conservative_when_triage_is_unavailable(self):
+        from app.pipeline.decode_lattice import build_decode_windows
+
+        windows = build_decode_windows(60000, speech_islands=None)
+
+        assert all(window["scheduled"] for window in windows)
+
 
 class TestStripeGrouping:
     """Test 15-second commit stripes."""
@@ -124,6 +152,111 @@ class TestStripeGrouping:
         stripes = build_stripes(60000)
         for i in range(1, len(stripes)):
             assert stripes[i]["start_ms"] == stripes[i-1]["end_ms"]
+
+    def test_extract_stripe_text_uses_explicit_seconds_unit(self):
+        from app.pipeline.stripe_grouping import _extract_stripe_text
+
+        candidate = {
+            "window_start_ms": 600000,
+            "window_end_ms": 630000,
+            "raw_text": "privet mir",
+            "segments": [
+                {"start": 0.0, "end": 28.5, "text": "privet mir"},
+            ],
+            "decode_metadata": {"segment_timestamp_unit": "seconds"},
+        }
+
+        text = _extract_stripe_text(candidate, 615000, 630000)
+        assert text == "privet mir"
+
+    def test_extract_stripe_text_infers_seconds_from_window_duration(self):
+        from app.pipeline.stripe_grouping import _extract_stripe_text
+
+        candidate = {
+            "window_start_ms": 600000,
+            "window_end_ms": 630000,
+            "raw_text": "dobryy den",
+            "segments": [
+                {"start": 0.0, "end": 28.5, "text": "dobryy den"},
+            ],
+        }
+
+        text = _extract_stripe_text(candidate, 615000, 630000)
+        assert text == "dobryy den"
+
+    def test_extract_stripe_text_preserves_millisecond_segments(self):
+        from app.pipeline.stripe_grouping import _extract_stripe_text
+
+        candidate = {
+            "window_start_ms": 600000,
+            "window_end_ms": 630000,
+            "raw_text": "millisecond text",
+            "segments": [
+                {"start": 1200, "end": 1800, "text": "millisecond text"},
+            ],
+        }
+
+        text = _extract_stripe_text(candidate, 601000, 602000)
+        assert text == "millisecond text"
+
+    def test_run_stripe_grouping_includes_first_pass_candidates(self, tmp_sessions_dir):
+        from app.core.atomic_io import atomic_write_json
+        from app.pipeline.stripe_grouping import run_stripe_grouping
+        from app.storage.session_store import create_session, session_dir
+
+        sid = create_session({"mode": "stream"})["session_id"]
+        sd = session_dir(sid)
+
+        window = {
+            "window_id": "W000000",
+            "start_ms": 0,
+            "end_ms": 30000,
+            "window_type": "full",
+            "scheduled": True,
+        }
+        shared_segments = [{"start": 0.0, "end": 15.0, "text": "privet"}]
+
+        atomic_write_json(str(sd / "candidates" / "cand_medium.json"), {
+            "candidate_id": "cand_medium",
+            "session_id": sid,
+            "model_id": "faster-whisper:medium",
+            "window_id": "W000000",
+            "window_start_ms": 0,
+            "window_end_ms": 30000,
+            "window_type": "full",
+            "raw_text": "privet",
+            "segments": shared_segments,
+            "language_evidence": {"detected_language": "ru"},
+            "confidence_features": {"success": True, "degraded": False},
+            "decode_metadata": {"segment_timestamp_unit": "seconds"},
+        })
+        atomic_write_json(str(sd / "candidates" / "cand_large.json"), {
+            "candidate_id": "cand_large",
+            "session_id": sid,
+            "model_id": "faster-whisper:large-v3",
+            "window_id": "W000000",
+            "window_start_ms": 0,
+            "window_end_ms": 30000,
+            "window_type": "full",
+            "raw_text": "privet",
+            "segments": shared_segments,
+            "language_evidence": {"detected_language": "ru"},
+            "confidence_features": {"success": True, "degraded": False},
+            "decode_metadata": {"segment_timestamp_unit": "seconds"},
+        })
+
+        class StageStub:
+            def commit(self, artifacts=None):
+                self.artifacts = artifacts or []
+
+        result = run_stripe_grouping(sid, [window], 30000, StageStub())
+        first_stripe = result["stripes"][0]
+
+        assert first_stripe["model_ids"] == ["faster-whisper:large-v3", "faster-whisper:medium"]
+        assert {item["model_id"] for item in first_stripe["evidence"]} == {
+            "faster-whisper:large-v3",
+            "faster-whisper:medium",
+        }
 
 
 class TestModelReplacement:
@@ -169,6 +302,11 @@ class TestModelReplacement:
         model_ids = [m.model_id for m in models]
         assert "nemo-asr:parakeet-tdt-0.6b-v3" in model_ids
 
+    def test_default_first_pass_is_medium(self):
+        from app.models.registry import DEFAULT_FIRST_PASS
+
+        assert DEFAULT_FIRST_PASS == "faster-whisper:medium"
+
 
 class TestCanonicalAssembly:
     """Test canonical segment assembly from reconciliation."""
@@ -209,15 +347,90 @@ class TestCanonicalAssembly:
 
     def test_provisional_vs_stabilized(self):
         from app.pipeline.canonical_assembly import stabilize_stripes
-        records = [{"stripe_id": "S0", "start_ms": 0, "end_ms": 15000,
+        records = [{"stripe_id": "S1", "start_ms": 15000, "end_ms": 30000,
                      "chosen_text": "hello", "confidence": 0.8}]
-        packets = [{"stripe_id": "S0", "support_window_count": 1}]
+        packets = [
+            {"stripe_id": "S0", "support_window_count": 2},
+            {"stripe_id": "S1", "support_window_count": 1},
+            {"stripe_id": "S2", "support_window_count": 2},
+        ]
         result = stabilize_stripes(records, packets)
         assert result[0]["stabilization_state"] == "provisional"
 
-        packets[0]["support_window_count"] = 2
+        packets[1]["support_window_count"] = 2
         result = stabilize_stripes(records, packets)
         assert result[0]["stabilization_state"] == "stabilized"
+
+    def test_boundary_stripes_finalize_with_single_support(self):
+        from app.pipeline.canonical_assembly import stabilize_stripes
+
+        records = [
+            {"stripe_id": "S0", "start_ms": 0, "end_ms": 15000, "chosen_text": "alpha", "confidence": 0.8},
+            {"stripe_id": "S2", "start_ms": 30000, "end_ms": 45000, "chosen_text": "omega", "confidence": 0.8},
+        ]
+        packets = [
+            {"stripe_id": "S0", "support_window_count": 1},
+            {"stripe_id": "S1", "support_window_count": 2},
+            {"stripe_id": "S2", "support_window_count": 1},
+        ]
+
+        result = stabilize_stripes(records, packets)
+        assert [row["stabilization_state"] for row in result] == ["stabilized", "stabilized"]
+
+    def test_final_transcript_keeps_boundary_stripes(self, tmp_sessions_dir):
+        from app.pipeline.canonical_assembly import (
+            build_transcript_surfaces,
+            merge_into_segments,
+            stabilize_stripes,
+        )
+        from app.storage.session_store import create_session, session_dir
+
+        sid = create_session({"mode": "stream"})["session_id"]
+        sd = session_dir(sid)
+        assert sd.is_dir()
+
+        records = [
+            {
+                "stripe_id": "S0",
+                "start_ms": 0,
+                "end_ms": 15000,
+                "chosen_text": "privet",
+                "chosen_source": "faster-whisper:medium",
+                "confidence": 0.8,
+                "language": "ru",
+            },
+            {
+                "stripe_id": "S1",
+                "start_ms": 15000,
+                "end_ms": 30000,
+                "chosen_text": "mir",
+                "chosen_source": "faster-whisper:large-v3",
+                "confidence": 0.9,
+                "language": "ru",
+            },
+        ]
+        packets = [
+            {
+                "stripe_id": "S0",
+                "support_window_count": 1,
+                "support_windows": ["W000000"],
+                "support_models": ["faster-whisper:medium"],
+            },
+            {
+                "stripe_id": "S1",
+                "support_window_count": 1,
+                "support_windows": ["W000001"],
+                "support_models": ["faster-whisper:large-v3"],
+            },
+        ]
+
+        stabilized = stabilize_stripes(records, packets)
+        segments = merge_into_segments(stabilized)
+        surfaces = build_transcript_surfaces(segments, sid)
+
+        assert surfaces["text"] == "privet mir"
+        assert surfaces["final_transcript"]["segment_count"] == 2
+        assert surfaces["stabilized_partial"]["text"] == "privet mir"
 
 
 class TestPipelineRun:
@@ -247,8 +460,8 @@ class TestPipelineRun:
         sd = tmp_sessions_dir / "test-session3"
         sd.mkdir()
         run = create_canonical_run(str(sd), "test-session3", {})
-        run.skip_stage("speaker_diarization", "not_justified")
-        assert run.is_stage_done("speaker_diarization")
+        run.skip_stage("selective_enrichment", "not_justified")
+        assert run.is_stage_done("selective_enrichment")
 
     def test_fallback_stage(self, tmp_sessions_dir):
         from app.pipeline.run import create_canonical_run, STAGE_DONE
@@ -273,6 +486,12 @@ class TestPipelineRun:
 class TestFailureHandling:
     """Test graceful degradation on failures."""
 
+    def test_model_priority_tracks_default_first_pass(self):
+        from app.models.registry import DEFAULT_FIRST_PASS, resolve_model_id
+        from app.pipeline.reconciliation import MODEL_PRIORITY
+
+        assert resolve_model_id(DEFAULT_FIRST_PASS) in MODEL_PRIORITY
+
     def test_reconciliation_deterministic_fallback(self):
         from app.pipeline.reconciliation import _select_fallback
         evidence = [
@@ -295,6 +514,17 @@ class TestFailureHandling:
         evidence = [{"model_id": "m1", "text": "", "trust_score": 0.5}]
         result = _select_fallback(evidence)
         assert result["chosen_text"] == ""
+
+    def test_fallback_uses_medium_when_large_is_empty(self):
+        from app.pipeline.reconciliation import _select_fallback
+
+        evidence = [
+            {"model_id": "faster-whisper:large-v3", "text": "", "trust_score": 0.95},
+            {"model_id": "faster-whisper:medium", "text": "privet mir", "trust_score": 0.8},
+        ]
+        result = _select_fallback(evidence)
+        assert result["chosen_source"] == "faster-whisper:medium"
+        assert result["chosen_text"] == "privet mir"
 
     def test_llm_response_parsing(self):
         from app.pipeline.reconciliation import _parse_llm_response
@@ -345,6 +575,76 @@ class TestDerivedOutputs:
         assert "issues" in report
         assert "reading_text" in report
 
+    def test_retrieval_index_grounded_on_segments(self, tmp_sessions_dir):
+        import json
+        from app.storage.session_store import create_session, session_dir
+        from app.pipeline.derived_outputs import build_derived_dir
+
+        sid = create_session({"mode": "stream"})["session_id"]
+        sd = session_dir(sid)
+        segments = [{
+            "segment_id": "seg_000001",
+            "start_ms": 1000,
+            "end_ms": 4000,
+            "speaker": None,
+            "text": "Bonjour tout le monde",
+            "language": "fr",
+            "confidence": 0.9,
+            "support_windows": ["W000001", "W000002"],
+            "support_models": ["faster-whisper:large-v3"],
+            "stabilization_state": "stabilized",
+        }]
+
+        build_derived_dir(sid, segments, "Bonjour tout le monde", 5000)
+        retrieval_path = sd / "derived" / "retrieval_index.json"
+        assert retrieval_path.is_file()
+
+        payload = json.loads(retrieval_path.read_text(encoding="utf-8"))
+        assert payload["entry_count"] == 1
+        assert payload["entries"][0]["grounding"]["segment_id"] == "seg_000001"
+        assert payload["entries"][0]["grounding"]["canonical_path"] == "canonical/canonical_segments.json"
+
+
+class TestSelectiveEnrichment:
+    def test_honors_off_policy(self, tmp_sessions_dir, monkeypatch):
+        from app.storage.session_store import create_session, update_session_meta
+        from app.pipeline.selective_enrichment import run_selective_enrichment
+
+        sid = create_session({"mode": "stream"})["session_id"]
+        update_session_meta(sid, {"diarization_policy": "off", "run_diarization": True})
+
+        calls = []
+
+        def fake_run_diarization(*args, **kwargs):
+            calls.append((args, kwargs))
+            return [{"speaker": "SPEAKER_01", "start_s": 0.0, "end_s": 1.0}]
+
+        monkeypatch.setattr("app.pipeline.selective_enrichment.run_diarization", fake_run_diarization)
+
+        class StageStub:
+            def commit(self, artifacts=None):
+                self.artifacts = artifacts or []
+
+        stage = StageStub()
+        segments = [{
+            "segment_id": "seg_000000",
+            "start_ms": 0,
+            "end_ms": 1000,
+            "speaker": None,
+            "text": "hello",
+            "language": "en",
+            "confidence": 0.9,
+            "support_windows": ["W000000"],
+            "support_models": ["faster-whisper:large-v3"],
+            "stabilization_state": "stabilized",
+            "stripes": ["S0"],
+            "assembly_decisions": [],
+        }]
+
+        result = run_selective_enrichment(sid, segments, "unused.wav", stage)
+        assert calls == []
+        assert result["diarization_policy"] == "off"
+
 
 class TestIngestAndTimeline:
     """Test ingest and normalization."""
@@ -372,6 +672,42 @@ class TestIngestAndTimeline:
         result = normalize_audio_file(src, dst)
         assert result["success"] is True
         assert os.path.isfile(dst)
+
+    def test_render_session_timeline_preserves_gap(self, tmp_sessions_dir, make_wav_bytes):
+        import wave
+        from app.storage.session_store import create_session, register_chunk, session_dir
+        from app.pipeline.ingest import build_session_timeline, render_session_timeline_audio
+
+        sid = create_session({"mode": "stream"})["session_id"]
+        sd = session_dir(sid)
+
+        (sd / "chunks" / "chunk_0000.wav").write_bytes(make_wav_bytes(duration_s=1.0))
+        register_chunk(sid, 0, {
+            "chunk_index": 0,
+            "chunk_started_ms": 0,
+            "chunk_duration_ms": 1000,
+        })
+
+        (sd / "chunks" / "chunk_0001.wav").write_bytes(make_wav_bytes(duration_s=1.0))
+        register_chunk(sid, 1, {
+            "chunk_index": 1,
+            "chunk_started_ms": 2000,
+            "chunk_duration_ms": 1000,
+        })
+
+        timeline = build_session_timeline(sid)
+        assert timeline["integrity"]["has_gaps"] is True
+        assert timeline["integrity"]["total_gap_ms"] == 1000
+        assert timeline["total_duration_ms"] == 3000
+
+        output = str(sd / "normalized" / "audio.wav")
+        result = render_session_timeline_audio(sid, output, timeline=timeline)
+        assert result["success"] is True
+        assert result["normalized_duration_ms"] == 3000
+
+        with wave.open(output, "rb") as wf:
+            duration_ms = int(round(wf.getnframes() / wf.getframerate() * 1000))
+        assert duration_ms == 3000
 
 
 class TestAcousticTriage:

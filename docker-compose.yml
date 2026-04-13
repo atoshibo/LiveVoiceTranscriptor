@@ -34,7 +34,7 @@ services:
       TLS_AUTO_GENERATE_SELF_SIGNED: "true"
       TLS_CERT_COMMON_NAME: localhost
     volumes:
-      - sessions-data:/data/sessions
+      - ${HOST_SESSIONS_DIR:-./data/sessions}:/data/sessions
       - certs-data:/data/certs
       - ${HOST_MODELS_DIR:-./models}:/models:ro
     depends_on:
@@ -48,6 +48,7 @@ services:
       target: worker
       args:
         INSTALL_OPTIONAL_MODEL_DEPS: "true"
+        PYTORCH_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cu124"
     env_file:
       - .env
     environment:
@@ -58,8 +59,9 @@ services:
       STRICT_CUDA: "false"
       TLS_ENABLED: "false"
     volumes:
-      - sessions-data:/data/sessions
+      - ${HOST_SESSIONS_DIR:-./data/sessions}:/data/sessions
       - ${HOST_MODELS_DIR:-./models}:/models:ro
+    gpus: all
     depends_on:
       redis:
         condition: service_healthy
@@ -67,5 +69,4 @@ services:
 
 volumes:
   redis-data:
-  sessions-data:
   certs-data:

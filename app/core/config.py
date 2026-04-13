@@ -18,7 +18,7 @@ except ImportError:  # pragma: no cover - exercised in minimal environments
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DEFAULT_MODELS_DIR = r"C:\Users\akova\OneDrive\Documents\DevOurs\VoiceRecordTranscriptor\models"
+DEFAULT_MODELS_DIR = str(PROJECT_ROOT / "models")
 
 
 def _load_project_env() -> None:
@@ -96,10 +96,22 @@ class PipelineGeometry:
 @dataclass(frozen=True)
 class StorageConfig:
     sessions_dir: str = ""
+    auto_cleanup_draft_sessions: bool = True
+    draft_session_max_age_minutes: int = 120
 
     def __post_init__(self) -> None:
         value = _resolve_path(_env("SESSIONS_DIR", ""), str(PROJECT_ROOT / "data" / "sessions"))
         object.__setattr__(self, "sessions_dir", value)
+        object.__setattr__(
+            self,
+            "auto_cleanup_draft_sessions",
+            _env_bool("AUTO_CLEANUP_DRAFT_SESSIONS", True),
+        )
+        object.__setattr__(
+            self,
+            "draft_session_max_age_minutes",
+            _env_int("DRAFT_SESSION_MAX_AGE_MINUTES", 120),
+        )
 
 
 @dataclass(frozen=True)

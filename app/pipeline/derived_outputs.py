@@ -17,6 +17,7 @@ Output: derived/ and current/ (compatibility read surface)
 import os
 import logging
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -80,7 +81,7 @@ def generate_speaker_transcript(segments: List[Dict]) -> Dict:
     text_lines = []
 
     for seg in segments:
-        speaker = seg.get("speaker", "SPEAKER_00")
+        speaker = seg.get("speaker")
         start_s = round(seg["start_ms"] / 1000, 1)
         end_s = round(seg["end_ms"] / 1000, 1)
         text = seg.get("text", "")
@@ -92,7 +93,10 @@ def generate_speaker_transcript(segments: List[Dict]) -> Dict:
             "text": text,
         })
 
-        text_lines.append(f"[{speaker}] {start_s}s\u2013{end_s}s")
+        if speaker:
+            text_lines.append(f"[{speaker}] {start_s}s\u2013{end_s}s")
+        else:
+            text_lines.append(f"{start_s}s\u2013{end_s}s")
         text_lines.append(text)
         text_lines.append("")
 
@@ -214,6 +218,150 @@ def generate_clean_transcript(segments: List[Dict], text: str) -> Dict:
     }
 
 
+def _normalized_retrieval_text(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
+def _extract_keywords(text: str, limit: int = 8) -> List[str]:
+    keywords = []
+    for token in _normalized_retrieval_text(text).split():
+        token = "".join(ch for ch in token if ch.isalnum())
+        if len(token) < 3:
+            continue
+        if token in keywords:
+            continue
+        keywords.append(token)
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+def generate_retrieval_index(session_id: str, segments: List[Dict]) -> Dict:
+    """Ground retrieval entries directly on canonical segments."""
+    entries = []
+    for i, seg in enumerate(segments):
+        text = seg.get("text", "").strip()
+        if not text:
+            continue
+        entries.append({
+            "entry_id": f"ret_{i:06d}",
+            "segment_id": seg.get("segment_id"),
+            "text": text,
+            "normalized_text": _normalized_retrieval_text(text),
+            "keywords": _extract_keywords(text),
+            "language": seg.get("language"),
+            "speaker": seg.get("speaker"),
+            "grounding": {
+                "segment_id": seg.get("segment_id"),
+                "start_ms": seg.get("start_ms"),
+                "end_ms": seg.get("end_ms"),
+                "canonical_path": "canonical/canonical_segments.json",
+            },
+            "support_windows": seg.get("support_windows", []),
+            "support_models": seg.get("support_models", []),
+            "stabilization_state": seg.get("stabilization_state", "stabilized"),
+        })
+
+    return {
+        "session_id": session_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "canonical_segments",
+        "entry_count": len(entries),
+        "entries": entries,
+    }
+
+
+def _write_output_bundle(output_dir: Path, session_id: str, segments: List[Dict],
+                         audio_duration_ms: int, include_retrieval: bool = False) -> Dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    final_segments = [seg for seg in segments if seg.get("stabilization_state") == "stabilized"]
+    final_text = " ".join(seg.get("text", "") for seg in final_segments if seg.get("text"))
+
+    atomic_write_text(str(output_dir / "transcript.txt"), final_text)
+
+    speaker = generate_speaker_transcript(final_segments)
+    atomic_write_json(str(output_dir / "transcript_by_speaker.json"), speaker["json"])
+    atomic_write_text(str(output_dir / "transcript_by_speaker.txt"), speaker["text"])
+
+    atomic_write_text(str(output_dir / "subtitles.srt"), generate_srt(final_segments))
+    atomic_write_text(str(output_dir / "subtitles.vtt"), generate_vtt(final_segments))
+
+    atomic_write_json(str(output_dir / "transcript_timestamps.json"), {
+        "segments": [
+            {
+                "start": seg["start_ms"] / 1000,
+                "end": seg["end_ms"] / 1000,
+                "text": seg.get("text", ""),
+                "speaker": seg.get("speaker"),
+            }
+            for seg in final_segments
+        ],
+        "words": [
+            {
+                "t_ms": seg["start_ms"],
+                "speaker": seg.get("speaker"),
+                "w": seg.get("text", ""),
+            }
+            for seg in final_segments
+        ],
+    })
+
+    quality = generate_quality_report(final_segments, final_text, audio_duration_ms)
+    atomic_write_json(str(output_dir / "quality_report.json"), quality)
+
+    raw = generate_raw_transcript(final_segments, final_text)
+    atomic_write_json(str(output_dir / "raw_transcript.json"), raw)
+
+    clean = generate_clean_transcript(final_segments, final_text)
+    atomic_write_json(str(output_dir / "clean_transcript.json"), clean)
+
+    files_written = [
+        "transcript.txt",
+        "transcript_by_speaker.json",
+        "transcript_by_speaker.txt",
+        "subtitles.srt",
+        "subtitles.vtt",
+        "transcript_timestamps.json",
+        "quality_report.json",
+        "raw_transcript.json",
+        "clean_transcript.json",
+    ]
+
+    if include_retrieval:
+        retrieval = generate_retrieval_index(session_id, final_segments)
+        atomic_write_json(str(output_dir / "retrieval_index.json"), retrieval)
+        files_written.append("retrieval_index.json")
+
+    return {
+        "files_written": files_written,
+        "final_segments": final_segments,
+        "final_text": final_text,
+    }
+
+
+def build_derived_dir(session_id: str, segments: List[Dict],
+                      text: str, audio_duration_ms: int) -> Dict:
+    """Build the spec-facing derived/ layer, including retrieval grounding."""
+    sd = session_dir(session_id)
+    derived = sd / "derived"
+    result = _write_output_bundle(derived, session_id, segments, audio_duration_ms, include_retrieval=True)
+
+    canonical = sd / "canonical"
+    for fname in [
+        "provenance.json",
+        "provisional_partial.json",
+        "stabilized_partial.json",
+        "final_transcript.json",
+    ]:
+        src = canonical / fname
+        if src.is_file():
+            shutil.copy2(str(src), str(derived / fname))
+            result["files_written"].append(fname)
+
+    return result
+
+
 def build_current_dir(session_id: str, segments: List[Dict],
                       text: str, audio_duration_ms: int) -> Dict:
     """Build the current/ compatibility read surface.
@@ -222,57 +370,7 @@ def build_current_dir(session_id: str, segments: List[Dict],
     """
     sd = session_dir(session_id)
     current = sd / "current"
-    current.mkdir(parents=True, exist_ok=True)
-
-    final_segments = [seg for seg in segments if seg.get("stabilization_state") == "stabilized"]
-    final_text = " ".join(seg.get("text", "") for seg in final_segments if seg.get("text"))
-
-    # 1. Transcript text
-    atomic_write_text(str(current / "transcript.txt"), final_text)
-
-    # 2. Speaker transcript
-    speaker = generate_speaker_transcript(final_segments)
-    atomic_write_json(str(current / "transcript_by_speaker.json"), speaker["json"])
-    atomic_write_text(str(current / "transcript_by_speaker.txt"), speaker["text"])
-
-    # 3. Subtitles
-    srt = generate_srt(final_segments)
-    vtt = generate_vtt(final_segments)
-    atomic_write_text(str(current / "subtitles.srt"), srt)
-    atomic_write_text(str(current / "subtitles.vtt"), vtt)
-
-    # 4. Timestamps
-    atomic_write_json(str(current / "transcript_timestamps.json"), {
-        "segments": [
-            {
-                "start": seg["start_ms"] / 1000,
-                "end": seg["end_ms"] / 1000,
-                "text": seg.get("text", ""),
-                "speaker": seg.get("speaker", "SPEAKER_00"),
-            }
-            for seg in final_segments
-        ],
-        "words": [
-            {
-                "t_ms": seg["start_ms"],
-                "speaker": seg.get("speaker", "SPEAKER_00"),
-                "w": seg.get("text", ""),
-            }
-            for seg in final_segments
-        ],
-    })
-
-    # 5. Quality report
-    quality = generate_quality_report(final_segments, final_text, audio_duration_ms)
-    atomic_write_json(str(current / "quality_report.json"), quality)
-
-    # 6. Raw transcript
-    raw = generate_raw_transcript(final_segments, final_text)
-    atomic_write_json(str(current / "raw_transcript.json"), raw)
-
-    # 7. Clean transcript
-    clean = generate_clean_transcript(final_segments, final_text)
-    atomic_write_json(str(current / "clean_transcript.json"), clean)
+    result = _write_output_bundle(current, session_id, segments, audio_duration_ms)
 
     # 8. Canonical layer surfaces + provenance
     for fname in [
@@ -284,6 +382,7 @@ def build_current_dir(session_id: str, segments: List[Dict],
         src = sd / "canonical" / fname
         if src.is_file():
             shutil.copy2(str(src), str(current / fname))
+            result["files_written"].append(fname)
 
     # 9. Backward-compat copies to session root
     for fname in ["transcript.txt", "subtitles.srt", "subtitles.vtt",
@@ -295,15 +394,7 @@ def build_current_dir(session_id: str, segments: List[Dict],
         src = current / fname
         if src.is_file():
             shutil.copy2(str(src), str(sd / fname))
-
-    return {
-        "files_written": [
-            "transcript.txt", "transcript_by_speaker.json",
-            "transcript_by_speaker.txt", "subtitles.srt", "subtitles.vtt",
-            "transcript_timestamps.json", "quality_report.json",
-            "raw_transcript.json", "clean_transcript.json", "provenance.json",
-        ],
-    }
+    return result
 
 
 def run_derived_outputs(session_id: str, segments: List[Dict],
@@ -312,6 +403,12 @@ def run_derived_outputs(session_id: str, segments: List[Dict],
 
     Builds all derived files and the current/ compatibility surface.
     """
-    result = build_current_dir(session_id, segments, text, audio_duration_ms)
-    stage.commit()
-    return result
+    derived_result = build_derived_dir(session_id, segments, text, audio_duration_ms)
+    current_result = build_current_dir(session_id, segments, text, audio_duration_ms)
+    files_written = sorted(set((derived_result.get("files_written") or []) + (current_result.get("files_written") or [])))
+    stage.commit(files_written)
+    return {
+        "derived": derived_result,
+        "current": current_result,
+        "files_written": files_written,
+    }

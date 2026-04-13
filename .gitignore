@@ -1,2 +1,4 @@
 models/
 .env
+data/sessions/
+data/worker_health.json

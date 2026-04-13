@@ -25,6 +25,48 @@ TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
 
 
+def _coerce_int(value, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ms_to_frames(ms: int, sample_rate: int) -> int:
+    return max(0, int(round((max(0, ms) / 1000.0) * sample_rate)))
+
+
+def _frames_to_ms(frames: int, sample_rate: int) -> int:
+    return int(round((max(0, frames) / max(1, sample_rate)) * 1000))
+
+
+def _chunk_path_map(session_id: str) -> Dict[int, str]:
+    chunk_dir = session_dir(session_id) / "chunks"
+    path_map: Dict[int, str] = {}
+    if not chunk_dir.is_dir():
+        return path_map
+
+    for path in sorted(chunk_dir.glob("chunk_*.wav")):
+        try:
+            chunk_index = int(path.stem.split("_")[-1])
+        except ValueError:
+            continue
+        path_map[chunk_index] = str(path)
+    return path_map
+
+
+def _wav_duration_ms(path: str) -> int:
+    try:
+        with wave.open(path, "rb") as wf:
+            sr = wf.getframerate()
+            frames = wf.getnframes()
+            return int(round((frames / max(1, sr)) * 1000))
+    except Exception:
+        return 0
+
+
 def normalize_audio_file(input_path: str, output_path: str,
                          target_sr: int = TARGET_SAMPLE_RATE,
                          target_channels: int = TARGET_CHANNELS) -> dict:
@@ -225,31 +267,45 @@ def build_session_timeline(session_id: str) -> dict:
 
     timeline_entries = []
     expected_start_ms = 0
+    chunk_paths = _chunk_path_map(session_id)
+    default_chunk_duration_ms = _coerce_int(meta.get("chunk_duration_sec"), 30) * 1000 or 30000
 
     for i, chunk_meta in enumerate(chunks):
-        chunk_start = chunk_meta.get("chunk_started_ms", expected_start_ms)
-        chunk_duration = chunk_meta.get("chunk_duration_ms", 30000)
+        chunk_index = _coerce_int(chunk_meta.get("chunk_index"), i)
+        chunk_path = chunk_paths.get(chunk_index)
+        actual_duration_ms = _wav_duration_ms(chunk_path) if chunk_path else 0
+        declared_duration_ms = _coerce_int(chunk_meta.get("chunk_duration_ms"), 0)
+        chunk_duration = max(declared_duration_ms, actual_duration_ms)
+        if chunk_duration <= 0:
+            chunk_duration = default_chunk_duration_ms
+
+        chunk_start = chunk_meta.get("chunk_started_ms")
+        if chunk_start is None:
+            chunk_start = expected_start_ms + _coerce_int(chunk_meta.get("gap_before_ms"), 0)
+        chunk_start = _coerce_int(chunk_start, expected_start_ms)
         chunk_end = chunk_start + chunk_duration
 
         gap_ms = chunk_start - expected_start_ms
         entry = {
-            "chunk_index": chunk_meta.get("chunk_index", i),
+            "chunk_index": chunk_index,
+            "chunk_path": chunk_path,
             "start_ms": chunk_start,
             "end_ms": chunk_end,
             "duration_ms": chunk_duration,
+            "actual_duration_ms": actual_duration_ms,
             "gap_before_ms": max(0, gap_ms),
             "overlap_before_ms": max(0, -gap_ms),
             "continuity": {
                 "dropped_frames": chunk_meta.get("dropped_frames", 0),
                 "decode_failure": chunk_meta.get("decode_failure", False),
-                "gap_before_ms": chunk_meta.get("gap_before_ms", 0),
+                "gap_before_ms": _coerce_int(chunk_meta.get("gap_before_ms"), max(0, gap_ms)),
                 "source_degraded": chunk_meta.get("source_degraded", False),
             }
         }
         timeline_entries.append(entry)
-        expected_start_ms = chunk_end
+        expected_start_ms = max(expected_start_ms, chunk_end)
 
-    total_duration_ms = timeline_entries[-1]["end_ms"] if timeline_entries else 0
+    total_duration_ms = max((entry["end_ms"] for entry in timeline_entries), default=0)
     gaps = [e for e in timeline_entries if e["gap_before_ms"] > 0]
     overlaps = [e for e in timeline_entries if e["overlap_before_ms"] > 0]
 
@@ -270,6 +326,132 @@ def build_session_timeline(session_id: str) -> dict:
     }
 
 
+def render_session_timeline_audio(
+    session_id: str,
+    output_path: str,
+    timeline: Optional[dict] = None,
+    target_sr: int = TARGET_SAMPLE_RATE,
+    target_channels: int = TARGET_CHANNELS,
+) -> dict:
+    """Render the normalized absolute timeline audio used by downstream stages."""
+    timeline = timeline or build_session_timeline(session_id)
+    if not timeline.get("success"):
+        return {"success": False, "error": timeline.get("error", "timeline_unavailable")}
+
+    entries = timeline.get("timeline", [])
+    total_duration_ms = _coerce_int(timeline.get("total_duration_ms"), 0)
+    total_frames = _ms_to_frames(total_duration_ms, target_sr)
+    frame_width = 2 * target_channels  # PCM_16 mono by contract
+    canvas = bytearray(total_frames * frame_width)
+    placements = []
+    written_chunks = 0
+    covered_until_frame = 0
+
+    for entry in entries:
+        chunk_path = entry.get("chunk_path")
+        placement = {
+            "chunk_index": entry.get("chunk_index"),
+            "source_path": os.path.basename(chunk_path) if chunk_path else None,
+            "start_ms": entry.get("start_ms", 0),
+            "end_ms": entry.get("end_ms", 0),
+            "duration_ms": entry.get("duration_ms", 0),
+            "skipped": False,
+        }
+
+        if not chunk_path or not os.path.isfile(chunk_path):
+            placement["skipped"] = True
+            placement["reason"] = "chunk_missing_on_disk"
+            placements.append(placement)
+            continue
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            normalized_chunk = tmp.name
+
+        try:
+            normalized_meta = normalize_audio_file(
+                chunk_path,
+                normalized_chunk,
+                target_sr=target_sr,
+                target_channels=target_channels,
+            )
+            if not normalized_meta.get("success"):
+                placement["skipped"] = True
+                placement["reason"] = normalized_meta.get("error", "normalization_failed")
+                placements.append(placement)
+                continue
+
+            with wave.open(normalized_chunk, "rb") as wf:
+                sr = wf.getframerate()
+                ch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                frames = wf.readframes(wf.getnframes())
+                chunk_frames = wf.getnframes()
+
+            if sr != target_sr or ch != target_channels or sw != 2:
+                placement["skipped"] = True
+                placement["reason"] = f"unexpected_normalized_format:{sr}/{ch}/{sw}"
+                placements.append(placement)
+                continue
+
+            start_frame = _ms_to_frames(_coerce_int(entry.get("start_ms"), 0), target_sr)
+            end_frame = min(start_frame + chunk_frames, total_frames)
+            frames_to_write = end_frame - start_frame
+            if frames_to_write <= 0:
+                placement["skipped"] = True
+                placement["reason"] = "outside_timeline"
+                placements.append(placement)
+                continue
+
+            byte_start = start_frame * frame_width
+            byte_end = byte_start + (frames_to_write * frame_width)
+            canvas[byte_start:byte_end] = frames[: frames_to_write * frame_width]
+
+            overlap_frames = max(0, covered_until_frame - start_frame)
+            covered_until_frame = max(covered_until_frame, end_frame)
+            written_chunks += 1
+
+            placement.update({
+                "placed_duration_ms": _frames_to_ms(frames_to_write, target_sr),
+                "placed_end_ms": _frames_to_ms(end_frame, target_sr),
+                "normalized_duration_ms": normalized_meta.get("normalized_duration_ms"),
+                "overwrote_previous_ms": _frames_to_ms(overlap_frames, target_sr),
+            })
+            placements.append(placement)
+        finally:
+            try:
+                os.unlink(normalized_chunk)
+            except OSError:
+                pass
+
+    if written_chunks == 0:
+        return {"success": False, "error": "No timeline chunks could be rendered"}
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(output_path, "wb") as out:
+        out.setnchannels(target_channels)
+        out.setsampwidth(2)
+        out.setframerate(target_sr)
+        out.writeframes(bytes(canvas))
+
+    return {
+        "success": True,
+        "output_path": output_path,
+        "sample_rate": target_sr,
+        "channels": target_channels,
+        "sample_width": 2,
+        "total_frames": total_frames,
+        "normalized_duration_ms": total_duration_ms,
+        "timeline_duration_ms": total_duration_ms,
+        "rendered_chunk_count": written_chunks,
+        "chunk_count": len(entries),
+        "placements": placements,
+        "gap_count": timeline.get("gaps", 0),
+        "overlap_count": timeline.get("overlaps", 0),
+        "overlap_strategy": "later_chunk_overwrites_earlier_audio_at_same_absolute_time",
+        "integrity": timeline.get("integrity", {}),
+    }
+
+
 def run_ingest_stage(session_id: str, stage) -> dict:
     """Execute the full ingest + normalization stage.
 
@@ -284,29 +466,28 @@ def run_ingest_stage(session_id: str, stage) -> dict:
     raw_audio = str(sd / "raw" / "audio.wav")
     normalized_audio = str(sd / "normalized" / "audio.wav")
 
-    # Step 1: Merge chunks
+    # Step 1: Merge chunks for audit/backward compatibility
     merge_result = merge_chunks(chunk_paths, raw_audio)
     atomic_write_json(str(sd / "raw" / "merge_meta.json"), merge_result)
 
-    if not merge_result.get("success"):
-        raise RuntimeError(f"Chunk merge failed: {merge_result.get('error')}")
+    # Step 2: Build absolute timeline metadata
+    timeline = build_session_timeline(session_id)
+    atomic_write_json(str(sd / "normalized" / "timeline.json"), timeline)
+    if not timeline.get("success"):
+        raise RuntimeError(f"Timeline build failed: {timeline.get('error')}")
 
-    # Also write to session root for backward compat
-    import shutil
-    compat_audio = str(sd / "audio.wav")
-    if os.path.isfile(raw_audio):
-        shutil.copy2(raw_audio, compat_audio)
-
-    # Step 2: Normalize
-    norm_result = normalize_audio_file(raw_audio, normalized_audio)
+    # Step 3: Render normalized audio on the absolute session timeline
+    norm_result = render_session_timeline_audio(session_id, normalized_audio, timeline=timeline)
     atomic_write_json(str(sd / "normalized" / "norm_meta.json"), norm_result)
 
     if not norm_result.get("success"):
-        raise RuntimeError(f"Normalization failed: {norm_result.get('error')}")
+        raise RuntimeError(f"Timeline render failed: {norm_result.get('error')}")
 
-    # Step 3: Build timeline
-    timeline = build_session_timeline(session_id)
-    atomic_write_json(str(sd / "normalized" / "timeline.json"), timeline)
+    # Prefer the absolute timeline audio as the compatibility root audio.
+    import shutil
+    compat_audio = str(sd / "audio.wav")
+    if os.path.isfile(normalized_audio):
+        shutil.copy2(normalized_audio, compat_audio)
 
     # Stage artifacts
     artifacts = ["audio.wav", "norm_meta.json", "timeline.json"]
@@ -316,5 +497,5 @@ def run_ingest_stage(session_id: str, stage) -> dict:
         "merge": merge_result,
         "normalization": norm_result,
         "timeline": timeline,
-        "audio_duration_ms": norm_result.get("normalized_duration_ms", 0),
+        "audio_duration_ms": timeline.get("total_duration_ms", norm_result.get("normalized_duration_ms", 0)),
     }

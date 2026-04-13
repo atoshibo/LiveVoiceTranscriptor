@@ -2,7 +2,7 @@
 Background Worker - Redis-backed job processor.
 
 Single-threaded to serialize GPU use. Processes:
-  - v2_canonical: Full canonical pipeline (12 stages)
+  - v2_canonical: Full canonical pipeline
   - v2_partial: Quick partial transcript for live preview
   - v2_retranscribe: Re-transcription with different model
   - v2 / legacy: Basic single-model transcription
@@ -43,7 +43,8 @@ from app.pipeline.run import (
 )
 from app.models.registry import (
     get_registry, resolve_model_id, get_model_info,
-    DEFAULT_FIRST_PASS, DEFAULT_CANDIDATE_A, DEFAULT_CANDIDATE_B,
+    DEFAULT_FIRST_PASS,
+    DEFAULT_CANDIDATE_A, DEFAULT_CANDIDATE_B,
     VALID_MODEL_SIZES,
 )
 
@@ -118,7 +119,15 @@ def _get_redis():
 
 def _get_gpu_diagnostics() -> dict:
     """Probe GPU health."""
-    result = {"gpu_available": False, "gpu_name": None, "gpu_reason": "not_checked"}
+    result = {
+        "gpu_available": False,
+        "gpu_name": None,
+        "gpu_reason": "not_checked",
+        "backend_status": {
+            "torch_cuda_available": False,
+            "ctranslate2_cuda_device_count": 0,
+        },
+    }
     try:
         import torch
         if torch.cuda.is_available():
@@ -126,13 +135,26 @@ def _get_gpu_diagnostics() -> dict:
             result["gpu_name"] = torch.cuda.get_device_name(0)
             result["gpu_reason"] = "cuda_available"
             props = torch.cuda.get_device_properties(0)
-            result["memory_total_mb"] = round(props.total_mem / 1024 / 1024)
+            result["memory_total_mb"] = round(props.total_memory / 1024 / 1024)
+            result["backend_status"]["torch_cuda_available"] = True
         else:
             result["gpu_reason"] = "cuda_not_available"
     except ImportError:
         result["gpu_reason"] = "torch_not_installed"
     except Exception as e:
         result["gpu_reason"] = str(e)
+
+    try:
+        import ctranslate2
+
+        cuda_devices = int(ctranslate2.get_cuda_device_count())
+        result["backend_status"]["ctranslate2_cuda_device_count"] = cuda_devices
+        if cuda_devices > 0 and not result["gpu_available"]:
+            result["gpu_available"] = True
+            result["gpu_reason"] = "ctranslate2_cuda_available"
+            result["gpu_name"] = result.get("gpu_name") or "CUDA device via CTranslate2"
+    except Exception:
+        pass
     return result
 
 
@@ -183,7 +205,7 @@ def _derive_action_hint(error_msg: str) -> str:
 
 
 def process_canonical_pipeline(job_data: dict):
-    """Process a full canonical pipeline job (12 stages).
+    """Process a full canonical pipeline job aligned to the specification.
 
     This is the primary job type. It implements the canonical spec:
     30s windows, 15s stride, 15s stripes, multi-ASR, reconciliation.
@@ -241,96 +263,11 @@ def process_canonical_pipeline(job_data: dict):
         normalized_audio = str(sd / "normalized" / "audio.wav")
 
         # ============================================================
-        # Stage 2: First Pass (faster-whisper:medium)
+        # Stage 2: Acoustic Triage
         # ============================================================
-        first_pass_result = None
-        if not run.is_stage_done("first_pass_medium"):
-            update_progress(session_id, "first_pass_medium", 15)
-            stage = run.start_stage("first_pass_medium")
-            try:
-                from app.pipeline.asr_executor import transcribe_window
-                raw_audio = str(sd / "audio.wav")
-                audio_to_use = raw_audio if os.path.isfile(raw_audio) else normalized_audio
-                first_pass_result = transcribe_window(
-                    audio_to_use,
-                    DEFAULT_FIRST_PASS,
-                    language=language,
-                    allowed_languages=language_ctx["allowed_languages"],
-                    forced_language=language_ctx["forced_language"],
-                    transcription_mode=language_ctx["transcription_mode"],
-                )
-
-                det_info = first_pass_result.get("detection_info", {})
-
-                # Persist first pass
-                atomic_write_json(str(stage.stage_dir / "first_pass.json"), {
-                    "text": first_pass_result.get("text", ""),
-                    "segments": first_pass_result.get("segments", []),
-                    "detection_info": det_info,
-                    "selected_language": language,
-                    "degraded": first_pass_result.get("degraded", False),
-                    "fallback_reason": first_pass_result.get("error"),
-                })
-                if first_pass_result.get("success"):
-                    stage.commit(["first_pass.json"])
-                else:
-                    stage.commit_with_fallback(["first_pass.json"], first_pass_result.get("error", "first_pass_unavailable"))
-
-                # Write partial preview
-                preview_text = first_pass_result.get("text", "")[:500]
-                update_status(session_id, "running", partial_preview=preview_text)
-            except Exception as e:
-                atomic_write_json(str(stage.stage_dir / "first_pass.json"), {
-                    "text": "",
-                    "segments": [],
-                    "detection_info": {},
-                    "selected_language": language,
-                    "degraded": True,
-                    "fallback_reason": str(e),
-                })
-                stage.commit_with_fallback(["first_pass.json"], f"first_pass_error:{e}")
-
-        # Unload first-pass model before diarization
-        _unload_all_vram()
-
-        # ============================================================
-        # Stage 3: Speaker Diarization (selective)
-        # ============================================================
-        speaker_turns = None
-        if not run.is_stage_done("speaker_diarization"):
-            update_progress(session_id, "speaker_diarization", 25)
-            stage = run.start_stage("speaker_diarization")
-            try:
-                from app.pipeline.selective_enrichment import should_run_diarization, run_diarization
-                meta = get_session_meta(session_id) or {}
-                if should_run_diarization(meta, []):
-                    speaker_turns = run_diarization(normalized_audio, meta)
-                    if speaker_turns:
-                        atomic_write_json(str(stage.stage_dir / "speaker_turns.json"), {
-                            "turns": speaker_turns,
-                        })
-                        stage.commit(["speaker_turns.json"])
-                    else:
-                        stage.commit_with_fallback([], "diarization_failed_or_unavailable")
-                else:
-                    stage.skip("not_justified")
-            except Exception as e:
-                stage.commit_with_fallback([], f"diarization_error: {e}")
-        else:
-            turns_data = safe_read_json(
-                str(run.get_stage("speaker_diarization").stage_dir / "speaker_turns.json")
-            )
-            if turns_data:
-                speaker_turns = turns_data.get("turns")
-
-        _unload_all_vram()
-
-        # ============================================================
-        # Stage 4: Acoustic Triage
-        # ============================================================
-        speech_islands = []
+        speech_islands = None
         if not run.is_stage_done("acoustic_triage"):
-            update_progress(session_id, "acoustic_triage", 30)
+            update_progress(session_id, "acoustic_triage", 18)
             stage = run.start_stage("acoustic_triage")
             try:
                 from app.pipeline.acoustic_triage import run_acoustic_triage
@@ -343,14 +280,19 @@ def process_canonical_pipeline(job_data: dict):
                 stage.commit_with_fallback([], f"triage_error: {e}")
         else:
             islands_data = safe_read_json(str(sd / "triage" / "speech_islands.json"))
-            speech_islands = (islands_data or {}).get("islands", [])
+            if islands_data is not None:
+                speech_islands = islands_data.get("islands", [])
+            elif (run.get_stage("acoustic_triage").error or "").startswith("fallback:"):
+                speech_islands = None
+            else:
+                speech_islands = []
 
         # ============================================================
-        # Stage 5: Decode Lattice
+        # Stage 3: Decode Lattice
         # ============================================================
         windows = []
         if not run.is_stage_done("decode_lattice"):
-            update_progress(session_id, "decode_lattice", 35)
+            update_progress(session_id, "decode_lattice", 28)
             stage = run.start_stage("decode_lattice")
             try:
                 from app.pipeline.decode_lattice import run_decode_lattice
@@ -366,10 +308,38 @@ def process_canonical_pipeline(job_data: dict):
             windows = (lattice_data or {}).get("windows", [])
 
         # ============================================================
-        # Stage 6: Candidate ASR - Large V3
+        # Stage 4: First Pass ASR - Medium
+        # ============================================================
+        if not run.is_stage_done("first_pass_medium"):
+            update_progress(session_id, "first_pass_medium", 36)
+            stage = run.start_stage("first_pass_medium")
+            try:
+                from app.pipeline.asr_executor import run_asr_execution
+                run_asr_execution(
+                    session_id, windows, [DEFAULT_FIRST_PASS],
+                    language=language,
+                    allowed_languages=language_ctx["allowed_languages"],
+                    forced_language=language_ctx["forced_language"],
+                    transcription_mode=language_ctx["transcription_mode"],
+                    progress_callback=lambda p: update_progress(
+                        session_id, "first_pass_medium", 36 + int(p * 0.08)
+                    ),
+                )
+                atomic_write_json(str(stage.stage_dir / "first_pass_routing.json"), {
+                    "selected_model": DEFAULT_FIRST_PASS,
+                    "language_context": language_ctx,
+                })
+                stage.commit(["first_pass_routing.json"])
+            except Exception as e:
+                stage.commit_with_fallback([], f"first_pass_medium_error: {e}")
+
+        _unload_all_vram()
+
+        # ============================================================
+        # Stage 5: Candidate ASR - Large V3
         # ============================================================
         if not run.is_stage_done("candidate_asr_large_v3"):
-            update_progress(session_id, "candidate_asr_large_v3", 40)
+            update_progress(session_id, "candidate_asr_large_v3", 46)
             stage = run.start_stage("candidate_asr_large_v3")
             try:
                 from app.pipeline.asr_executor import run_asr_execution
@@ -380,20 +350,24 @@ def process_canonical_pipeline(job_data: dict):
                     forced_language=language_ctx["forced_language"],
                     transcription_mode=language_ctx["transcription_mode"],
                     progress_callback=lambda p: update_progress(
-                        session_id, "candidate_asr_large_v3", 40 + int(p * 0.15)
+                        session_id, "candidate_asr_large_v3", 46 + int(p * 0.1)
                     ),
                 )
-                stage.commit()
+                atomic_write_json(str(stage.stage_dir / "candidate_a_routing.json"), {
+                    "selected_model": DEFAULT_CANDIDATE_A,
+                    "language_context": language_ctx,
+                })
+                stage.commit(["candidate_a_routing.json"])
             except Exception as e:
                 stage.commit_with_fallback([], f"candidate_a_error: {e}")
 
         _unload_all_vram()
 
         # ============================================================
-        # Stage 7: Candidate ASR - Parakeet (replaces Turbo)
+        # Stage 6: Candidate ASR - Parakeet / Canary route
         # ============================================================
         if not run.is_stage_done("candidate_asr_parakeet"):
-            update_progress(session_id, "candidate_asr_parakeet", 55)
+            update_progress(session_id, "candidate_asr_parakeet", 58)
             stage = run.start_stage("candidate_asr_parakeet")
             try:
                 from app.pipeline.asr_executor import run_asr_execution
@@ -408,7 +382,7 @@ def process_canonical_pipeline(job_data: dict):
                         forced_language=language_ctx["forced_language"],
                         transcription_mode=language_ctx["transcription_mode"],
                         progress_callback=lambda p: update_progress(
-                            session_id, "candidate_asr_parakeet", 55 + int(p * 0.15)
+                            session_id, "candidate_asr_parakeet", 58 + int(p * 0.1)
                         ),
                     )
                     atomic_write_json(str(stage.stage_dir / "candidate_b_routing.json"), {
@@ -430,7 +404,7 @@ def process_canonical_pipeline(job_data: dict):
         _unload_all_vram()
 
         # ============================================================
-        # Stage 8: Stripe Grouping
+        # Stage 7: Stripe Grouping
         # ============================================================
         stripe_packets = []
         if not run.is_stage_done("stripe_grouping"):
@@ -449,11 +423,11 @@ def process_canonical_pipeline(job_data: dict):
             stripe_packets = (sp_data or {}).get("stripes", [])
 
         # ============================================================
-        # Stage 9: Reconciliation
+        # Stage 8: Reconciliation
         # ============================================================
         reconciliation_result = {}
         if not run.is_stage_done("reconciliation"):
-            update_progress(session_id, "reconciliation", 75)
+            update_progress(session_id, "reconciliation", 79)
             stage = run.start_stage("reconciliation")
             try:
                 from app.pipeline.reconciliation import run_reconciliation
@@ -470,15 +444,15 @@ def process_canonical_pipeline(job_data: dict):
         _unload_all_vram()
 
         # ============================================================
-        # Stage 10: Canonical Assembly
+        # Stage 9: Canonical Assembly
         # ============================================================
         segments = []
         text = ""
         if not run.is_stage_done("canonical_assembly"):
-            update_progress(session_id, "canonical_assembly", 82)
+            update_progress(session_id, "canonical_assembly", 87)
             stage = run.start_stage("canonical_assembly")
             try:
-                from app.pipeline.canonical_assembly import run_canonical_assembly
+                from app.pipeline.canonical_assembly import run_canonical_assembly, build_transcript_surfaces
 
                 # If reconciliation produced records, use them
                 if reconciliation_result.get("records"):
@@ -486,36 +460,10 @@ def process_canonical_pipeline(job_data: dict):
                         session_id, reconciliation_result, stripe_packets, stage
                     )
                 else:
-                    # Fallback: build from first pass
-                    fp_data = safe_read_json(
-                        str(run.get_stage("first_pass_medium").stage_dir / "first_pass.json")
-                    ) or {}
-                    from app.pipeline.canonical_assembly import (
-                        merge_into_segments, build_transcript_surfaces
-                    )
-                    # Convert first-pass segments to stripe-like records
-                    fp_segments = fp_data.get("segments", [])
-                    fake_records = []
-                    for seg in fp_segments:
-                        fake_records.append({
-                            "stripe_id": "fallback",
-                            "start_ms": int(seg.get("start", 0) * 1000),
-                            "end_ms": int(seg.get("end", 0) * 1000),
-                            "chosen_text": seg.get("text", ""),
-                            "chosen_source": DEFAULT_FIRST_PASS,
-                            "confidence": 0.5,
-                            "method": "fallback",
-                            "stabilization_state": "provisional",
-                            "support_window_count": 1,
-                            "support_windows": [],
-                            "support_models": [DEFAULT_FIRST_PASS],
-                            "language": (fp_data.get("detection_info") or {}).get("detected_language"),
-                        })
-                    segments = merge_into_segments(fake_records)
-                    surfaces = build_transcript_surfaces(segments, session_id)
+                    surfaces = build_transcript_surfaces([], session_id, stripe_decisions=[])
                     text = surfaces["text"]
                     stage.commit()
-                    assembly_result = {"surfaces": surfaces, "segment_count": len(segments)}
+                    assembly_result = {"surfaces": surfaces, "segment_count": 0}
 
                 if assembly_result.get("surfaces"):
                     segments = assembly_result["surfaces"].get("segments", [])
@@ -532,10 +480,10 @@ def process_canonical_pipeline(job_data: dict):
                 text = text_path.read_text(encoding="utf-8")
 
         # ============================================================
-        # Stage 11: Selective Enrichment
+        # Stage 10: Selective Enrichment
         # ============================================================
         if not run.is_stage_done("selective_enrichment"):
-            update_progress(session_id, "selective_enrichment", 88)
+            update_progress(session_id, "selective_enrichment", 93)
             stage = run.start_stage("selective_enrichment")
             try:
                 from app.pipeline.selective_enrichment import run_selective_enrichment
@@ -552,10 +500,10 @@ def process_canonical_pipeline(job_data: dict):
         _unload_all_vram()
 
         # ============================================================
-        # Stage 12: Derived Outputs
+        # Stage 11: Derived Outputs
         # ============================================================
         if not run.is_stage_done("derived_outputs"):
-            update_progress(session_id, "derived_outputs", 92)
+            update_progress(session_id, "derived_outputs", 96)
             stage = run.start_stage("derived_outputs")
             try:
                 from app.pipeline.derived_outputs import run_derived_outputs

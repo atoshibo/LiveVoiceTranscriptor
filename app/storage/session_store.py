@@ -20,6 +20,7 @@ artifact hierarchy:
     status.json         - worker status
 """
 import os
+import stat
 import uuid
 import shutil
 import logging
@@ -65,6 +66,7 @@ def create_session(body: dict) -> dict:
     - chunk_duration_sec stored for diagnostics
     - diarization stored as diarization_hint
     """
+    cleanup_abandoned_draft_sessions()
     sid = str(uuid.uuid4())
     sd = ensure_session_dirs(sid)
 
@@ -223,36 +225,40 @@ def is_v2_session(session_id: str) -> bool:
 def delete_session(session_id: str) -> bool:
     sd = session_dir(session_id)
     if sd.is_dir():
-        shutil.rmtree(str(sd))
+        _remove_tree(sd)
         return True
     return False
 
 
 def list_sessions(limit: int = 100) -> List[dict]:
     """List sessions, newest first."""
+    cleanup_abandoned_draft_sessions()
     sdir = _sessions_dir()
     if not sdir.is_dir():
         return []
     sessions = []
-    entries = sorted(sdir.iterdir(), key=lambda p: p.name, reverse=True)
-    for entry in entries[:limit]:
+    entries = list(sdir.iterdir())
+    for entry in entries:
         if not entry.is_dir():
             continue
         meta = safe_read_json(str(entry / "v2_session.json"))
         status = safe_read_json(str(entry / "status.json"))
         if meta is None:
             continue
+        updated_at = _session_activity_timestamp(meta, status)
         sessions.append({
             "session_id": entry.name,
             "is_v2": meta.get("version") == "v2",
-            "status": (status or {}).get("status", "unknown"),
-            "updated_at": meta.get("last_chunk_at") or meta.get("created_at"),
+            "status": _display_session_state(meta, status),
+            "raw_status": (status or {}).get("status", "unknown"),
+            "updated_at": updated_at,
             "progress": (status or {}).get("progress", {}),
             "created_at": meta.get("created_at"),
             "device_id": meta.get("device_id"),
             "mode": meta.get("mode", "stream"),
         })
-    return sessions
+    sessions.sort(key=lambda item: _parse_iso_timestamp(item.get("updated_at")), reverse=True)
+    return sessions[:limit]
 
 
 def list_sessions_grouped() -> dict:
@@ -276,7 +282,7 @@ def list_sessions_grouped() -> dict:
 
         summary = {
             "session_id": sess["session_id"],
-            "state": meta.get("state", "unknown"),
+            "state": _display_session_state(meta, status_data),
             "backend_outcome": _derive_backend_outcome(status_data),
             "created_at": created,
             "finalized_at": meta.get("finalize_requested_at"),
@@ -317,6 +323,153 @@ def _derive_backend_outcome(status_data: dict) -> str:
     elif s in ("created", "uploaded", "pending"):
         return "queued"
     return "not_started"
+
+
+def cleanup_abandoned_draft_sessions(max_age_minutes: Optional[int] = None) -> dict:
+    """Delete stale sessions that never progressed beyond draft creation."""
+    cfg = get_config()
+    if not cfg.storage.auto_cleanup_draft_sessions:
+        return {
+            "enabled": False,
+            "deleted_count": 0,
+            "deleted_session_ids": [],
+        }
+
+    ttl_minutes = max_age_minutes
+    if ttl_minutes is None:
+        ttl_minutes = cfg.storage.draft_session_max_age_minutes
+    if ttl_minutes <= 0:
+        return {
+            "enabled": True,
+            "deleted_count": 0,
+            "deleted_session_ids": [],
+        }
+
+    now = datetime.now(timezone.utc)
+    deleted_session_ids = []
+    sdir = _sessions_dir()
+    if not sdir.is_dir():
+        return {
+            "enabled": True,
+            "deleted_count": 0,
+            "deleted_session_ids": [],
+        }
+
+    for entry in sdir.iterdir():
+        if not entry.is_dir():
+            continue
+        meta = safe_read_json(str(entry / "v2_session.json")) or {}
+        status = safe_read_json(str(entry / "status.json")) or {}
+        if not _is_abandoned_draft_session(entry, meta, status, now, ttl_minutes):
+            continue
+        try:
+            _remove_tree(entry)
+            deleted_session_ids.append(entry.name)
+        except OSError as exc:
+            logger.warning("Failed to delete abandoned draft session %s: %s", entry.name, exc)
+
+    if deleted_session_ids:
+        logger.info(
+            "Deleted %s abandoned draft session(s): %s",
+            len(deleted_session_ids),
+            ", ".join(sorted(deleted_session_ids)),
+        )
+
+    return {
+        "enabled": True,
+        "deleted_count": len(deleted_session_ids),
+        "deleted_session_ids": sorted(deleted_session_ids),
+    }
+
+
+def _display_session_state(meta: dict, status_data: dict) -> str:
+    raw_status = (status_data or {}).get("status", "")
+    session_state = (meta or {}).get("state", "")
+
+    if raw_status == "done":
+        return "done"
+    if raw_status in ("error", "cancelled"):
+        return "error"
+    if raw_status in ("running", "processing"):
+        return "running"
+    if session_state == "finalized" and raw_status in ("", "created", "uploaded", "pending"):
+        return "queued"
+    if raw_status in ("uploaded", "pending"):
+        return "queued"
+    if session_state:
+        return session_state
+    return raw_status or "unknown"
+
+
+def _session_activity_timestamp(meta: dict, status_data: dict) -> str:
+    for value in [
+        (status_data or {}).get("finished_at"),
+        (status_data or {}).get("started_at"),
+        (status_data or {}).get("queued_at"),
+        (meta or {}).get("finalize_requested_at"),
+        (meta or {}).get("last_chunk_at"),
+        (meta or {}).get("created_at"),
+    ]:
+        if value:
+            return value
+    return ""
+
+
+def _parse_iso_timestamp(value: Optional[str]) -> datetime:
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _is_abandoned_draft_session(
+    session_path: Path,
+    meta: dict,
+    status_data: dict,
+    now: datetime,
+    ttl_minutes: int,
+) -> bool:
+    if not meta:
+        return False
+    if meta.get("state") != "created":
+        return False
+    if meta.get("chunks"):
+        return False
+    if meta.get("first_chunk_at") or meta.get("last_chunk_at"):
+        return False
+    if meta.get("finalize_requested_at"):
+        return False
+
+    raw_status = (status_data or {}).get("status", "created")
+    if raw_status not in ("", "created"):
+        return False
+    if any((status_data or {}).get(key) for key in ("queued_at", "started_at", "finished_at")):
+        return False
+
+    # Keep anything that already wrote upload or pipeline artifacts.
+    if any((session_path / "chunks").glob("chunk_*.wav")):
+        return False
+    if (session_path / "metadata.json").is_file():
+        return False
+    if (session_path / "pipeline" / "canonical_run_id.txt").is_file():
+        return False
+
+    created_at = _parse_iso_timestamp(meta.get("created_at"))
+    age_seconds = (now - created_at).total_seconds()
+    return age_seconds >= ttl_minutes * 60
+
+
+def _remove_tree(path: Path) -> None:
+    def _onerror(func, target, exc_info):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            raise exc_info[1]
+
+    shutil.rmtree(str(path), onerror=_onerror)
 
 
 def _has_transcript(session_id: str) -> bool:

@@ -14,13 +14,20 @@ logger = logging.getLogger(__name__)
 
 def stabilize_stripes(reconciliation_records: List[Dict], stripe_packets: List[Dict] = None) -> List[Dict]:
     stabilized = []
-    packet_index = {packet.get("stripe_id"): packet for packet in (stripe_packets or [])}
+    ordered_packets = list(stripe_packets or [])
+    packet_index = {packet.get("stripe_id"): packet for packet in ordered_packets}
+    stripe_order = {packet.get("stripe_id"): idx for idx, packet in enumerate(ordered_packets)}
+    last_index = len(ordered_packets) - 1
 
     for record in reconciliation_records:
         stripe_id = record.get("stripe_id", "")
         packet = packet_index.get(stripe_id, {})
         support_count = record.get("support_window_count", packet.get("support_window_count", 1))
-        state = "stabilized" if support_count >= 2 else "provisional"
+        state = _resolve_stabilization_state(
+            support_count=support_count,
+            stripe_index=stripe_order.get(stripe_id),
+            last_index=last_index,
+        )
         stabilized.append(
             {
                 **record,
@@ -31,6 +38,18 @@ def stabilize_stripes(reconciliation_records: List[Dict], stripe_packets: List[D
             }
         )
     return stabilized
+
+
+def _resolve_stabilization_state(support_count: int, stripe_index: int | None, last_index: int) -> str:
+    if support_count >= 2:
+        return "stabilized"
+
+    # Session-boundary stripes cannot ever gain a second supporting window
+    # once the finalized decode lattice is fixed, so we flush them as final.
+    if support_count >= 1 and stripe_index is not None and stripe_index in {0, last_index}:
+        return "stabilized"
+
+    return "provisional"
 
 
 def merge_into_segments(stabilized_stripes: List[Dict]) -> List[Dict]:

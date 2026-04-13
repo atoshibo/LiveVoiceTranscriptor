@@ -21,7 +21,7 @@ import wave
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
 
-from app.core.atomic_io import atomic_write_json
+from app.core.atomic_io import atomic_write_json, safe_read_json
 from app.core.config import get_config
 from app.models.registry import (
     get_model_info, resolve_model_id, is_model_safe_for_language,
@@ -113,6 +113,7 @@ def _fallback_result(
         "degraded": True,
         "model_id": model_id,
         "fallback_segments": [{"start": 0.0, "end": end_s, "text": ""}] if end_s else [],
+        "segment_timestamp_unit": "seconds",
     }
 
 
@@ -138,15 +139,33 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str,
     try:
         from faster_whisper import WhisperModel
 
-        # Determine compute type and device
+        # faster-whisper runs on CTranslate2, so probe that backend first.
         device = "cpu"
         compute_type = "int8"
         try:
-            import torch
-            if torch.cuda.is_available():
+            import ctranslate2
+
+            if int(ctranslate2.get_cuda_device_count()) > 0:
                 device = "cuda"
                 compute_type = "float16"
-        except ImportError:
+        except Exception:
+            pass
+
+        if device == "cpu":
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    device = "cuda"
+                    compute_type = "float16"
+            except ImportError:
+                pass
+            except Exception:
+                pass
+
+        try:
+            if device == "cuda":
+                logger.info("Loading faster-whisper:%s on GPU", model_size)
+        except Exception:
             pass
 
         if _faster_whisper_model is None or getattr(_faster_whisper_model, '_model_size', '') != model_size:
@@ -181,6 +200,7 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str,
                 "requested_language": language,
             },
             "success": True,
+            "segment_timestamp_unit": "seconds",
         }
     except ImportError as e:
         logger.warning("faster-whisper not installed; using degraded fallback")
@@ -287,6 +307,7 @@ def _transcribe_nemo(audio_path: str, model_path: str,
                     "language_note": language_note,
                 },
                 "success": True,
+                "segment_timestamp_unit": "seconds",
             }
         finally:
             try:
@@ -361,6 +382,7 @@ def persist_candidate(session_id: str, window: Dict, model_id: str,
         "decode_metadata": {
             "model_id": model_id,
             "transcription_mode": result.get("transcription_mode"),
+            "segment_timestamp_unit": result.get("segment_timestamp_unit"),
         },
     }
 
@@ -447,6 +469,24 @@ def run_asr_execution(session_id: str, windows: List[Dict],
             "failed": sum(1 for c in model_cands if not c["confidence_features"].get("success")),
         }
 
-    atomic_write_json(str(sd / "candidates" / "asr_summary.json"), summary)
+    summary_path = sd / "candidates" / "asr_summary.json"
+    existing_summary = safe_read_json(str(summary_path)) or {}
+    merged_candidates_by_model = dict(existing_summary.get("candidates_by_model") or {})
+    merged_candidates_by_model.update(summary["candidates_by_model"])
 
-    return summary
+    merged_model_ids = []
+    for model_id in list(existing_summary.get("model_ids") or []) + model_ids:
+        if model_id not in merged_model_ids:
+            merged_model_ids.append(model_id)
+
+    merged_summary = {
+        "session_id": session_id,
+        "model_ids": merged_model_ids,
+        "window_count": max(existing_summary.get("window_count", 0), len(scheduled)),
+        "candidate_count": sum(item.get("count", 0) for item in merged_candidates_by_model.values()),
+        "candidates_by_model": merged_candidates_by_model,
+    }
+
+    atomic_write_json(str(summary_path), merged_summary)
+
+    return merged_summary

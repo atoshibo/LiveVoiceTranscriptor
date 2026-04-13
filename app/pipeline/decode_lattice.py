@@ -28,6 +28,26 @@ from app.storage.session_store import session_dir
 logger = logging.getLogger(__name__)
 
 
+def _bridge_crosses_speech_boundary(
+    start_ms: int,
+    end_ms: int,
+    speech_islands: List[Dict],
+    chunk_ms: int,
+) -> bool:
+    """Return True when a speech island spans a transport chunk boundary."""
+    if chunk_ms <= 0:
+        return False
+
+    first_boundary = ((start_ms // chunk_ms) + 1) * chunk_ms
+    boundary_ms = first_boundary
+    while boundary_ms < end_ms:
+        for island in speech_islands:
+            if island.get("start_ms", 0) < boundary_ms < island.get("end_ms", 0):
+                return True
+        boundary_ms += chunk_ms
+    return False
+
+
 def build_decode_windows(total_duration_ms: int,
                          speech_islands: List[Dict] = None,
                          window_ms: int = None,
@@ -68,8 +88,9 @@ def build_decode_windows(total_duration_ms: int,
             source_chunks = [f"C{i:04d}" for i in range(first_chunk, last_chunk + 1)]
 
         # Check speech intersection
-        speech_ratio = 1.0  # Default: assume speech if no triage
-        if speech_islands:
+        triage_available = speech_islands is not None
+        speech_ratio = 1.0  # Conservative fallback when triage is unavailable.
+        if triage_available:
             speech_overlap_ms = 0
             for island in speech_islands:
                 overlap_start = max(start_ms, island["start_ms"])
@@ -79,8 +100,14 @@ def build_decode_windows(total_duration_ms: int,
             window_duration = end_ms - start_ms
             speech_ratio = speech_overlap_ms / max(1, window_duration)
 
-        # Schedule: eligible if enough speech
-        scheduled = speech_ratio >= 0.05 or window_type == "bridge"
+        bridge_required = (
+            window_type == "bridge"
+            and triage_available
+            and _bridge_crosses_speech_boundary(start_ms, end_ms, speech_islands or [], chunk_ms)
+        )
+
+        # Schedule: eligible if enough speech, or mandatory bridge protection
+        scheduled = speech_ratio >= 0.05 or bridge_required
 
         window = {
             "window_id": f"W{window_idx:06d}",
@@ -90,6 +117,7 @@ def build_decode_windows(total_duration_ms: int,
             "window_type": window_type,
             "source_chunks": source_chunks,
             "speech_intersection_ratio": round(speech_ratio, 4),
+            "bridge_required": bridge_required,
             "scheduled": scheduled,
         }
         windows.append(window)
@@ -132,7 +160,7 @@ def extract_window_audio(audio_path: str, window: Dict,
 
 
 def run_decode_lattice(session_id: str, audio_path: str,
-                       audio_duration_ms: int, speech_islands: List[Dict],
+                       audio_duration_ms: int, speech_islands: Optional[List[Dict]],
                        stage) -> dict:
     """Execute decode lattice construction stage.
 

@@ -172,16 +172,7 @@ def _extract_stripe_text(candidate: Dict, stripe_start_ms: int,
 
     relevant_parts = []
     for seg in segments:
-        # Handle both ms and seconds formats
-        seg_start = seg.get("start", 0)
-        seg_end = seg.get("end", 0)
-        if seg_start < 100 and seg_end < 1000:
-            # Likely in seconds, convert to ms
-            seg_start_ms = seg_start * 1000
-            seg_end_ms = seg_end * 1000
-        else:
-            seg_start_ms = seg_start
-            seg_end_ms = seg_end
+        seg_start_ms, seg_end_ms = _segment_bounds_ms(candidate, seg)
 
         # Add window offset
         window_start = candidate.get("window_start_ms", 0)
@@ -201,6 +192,51 @@ def _extract_stripe_text(candidate: Dict, stripe_start_ms: int,
 
     # Fallback: return full text
     return candidate.get("raw_text", "")
+
+
+def _segment_bounds_ms(candidate: Dict, segment: Dict) -> Tuple[float, float]:
+    """Normalize provider segment timestamps to window-relative milliseconds.
+
+    New candidate artifacts persist an explicit unit in decode_metadata.
+    Older artifacts fall back to inference based on the decode window
+    duration, which is much safer than a fixed numeric threshold.
+    """
+    if "start_ms" in segment or "end_ms" in segment:
+        return float(segment.get("start_ms", 0.0)), float(segment.get("end_ms", 0.0))
+
+    seg_start = _coerce_float(segment.get("start", 0.0))
+    seg_end = _coerce_float(segment.get("end", seg_start))
+    unit = _segment_timestamp_unit(candidate, seg_start, seg_end)
+    multiplier = 1000.0 if unit == "seconds" else 1.0
+    return seg_start * multiplier, seg_end * multiplier
+
+
+def _segment_timestamp_unit(candidate: Dict, seg_start: float, seg_end: float) -> str:
+    decode_metadata = candidate.get("decode_metadata") or {}
+    explicit_unit = str(decode_metadata.get("segment_timestamp_unit") or "").strip().lower()
+    if explicit_unit in {"seconds", "milliseconds"}:
+        return explicit_unit
+
+    window_start_ms = _coerce_float(candidate.get("window_start_ms", 0.0))
+    window_end_ms = _coerce_float(candidate.get("window_end_ms", window_start_ms))
+    window_duration_ms = max(1.0, window_end_ms - window_start_ms)
+    window_duration_s = window_duration_ms / 1000.0
+    max_value = max(abs(seg_start), abs(seg_end))
+
+    # Legacy fallback: provider-local timestamps that fit inside the decode
+    # window span are treated as seconds; otherwise we assume milliseconds.
+    if max_value <= window_duration_s + 5.0:
+        return "seconds"
+    return "milliseconds"
+
+
+def _coerce_float(value, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _candidate_allowed_for_stripe(candidate: Dict, allowed_languages: List[str], forced_language: str) -> bool:

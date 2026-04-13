@@ -94,8 +94,10 @@ async def system_gpu(token: str = Depends(require_auth)):
         "gpu_available": gpu_info.get("gpu_available", False),
         "gpu_name": gpu_info.get("gpu_name"),
         "gpu_reason": gpu_info.get("gpu_reason"),
+        "selected_device": gpu_info.get("selected_device", "cpu"),
         "selected_compute_type": gpu_info.get("selected_compute_type", "int8"),
         "strict_cuda": gpu_info.get("strict_cuda", False),
+        "backend_status": gpu_info.get("backend_status", {}),
         "utilization_percent": gpu_info.get("utilization_percent"),
         "memory_used_mb": gpu_info.get("memory_used_mb"),
         "memory_total_mb": gpu_info.get("memory_total_mb"),
@@ -363,8 +365,19 @@ async def finalize_session(session_id: str, request: Request,
     if not chunk_paths:
         raise HTTPException(400, detail="Chunk files missing on disk.")
 
-    # Resolve diarization (aliases)
-    run_diarization = body.get("run_diarization", body.get("diarization", False))
+    # Resolve diarization contract.
+    diarization_flag_present = "run_diarization" in body or "diarization" in body
+    diarization_flag = body.get("run_diarization", body.get("diarization", False))
+    diarization_policy = body.get("diarization_policy")
+    if diarization_policy is None:
+        if diarization_flag_present:
+            diarization_policy = "forced" if diarization_flag else "off"
+        else:
+            diarization_policy = meta.get("diarization_policy", "auto")
+    diarization_policy = str(diarization_policy).strip().lower()
+    if diarization_policy not in {"auto", "off", "forced"}:
+        raise HTTPException(400, detail=f"Invalid diarization_policy '{diarization_policy}'. Allowed: auto, off, forced.")
+    run_diarization = diarization_policy == "forced"
 
     # Resolve speaker count (aliases)
     speaker_count = body.get("speaker_count", body.get("num_speakers"))
@@ -415,16 +428,16 @@ async def finalize_session(session_id: str, request: Request,
     if language_selection_strategy and language_selection_strategy != "ordered_fallback":
         raise HTTPException(400, detail=f"Unknown language_selection_strategy '{language_selection_strategy}'.")
 
-    # Merge chunks -> audio.wav
+    # Render absolute-timeline compatibility audio
     sd = session_dir(session_id)
     audio_path = str(sd / "audio.wav")
     try:
-        from app.pipeline.ingest import merge_chunks
-        merge_result = merge_chunks(chunk_paths, audio_path)
-        if not merge_result.get("success"):
-            raise RuntimeError(merge_result.get("error", "merge failed"))
+        from app.pipeline.ingest import render_session_timeline_audio
+        timeline_audio = render_session_timeline_audio(session_id, audio_path)
+        if not timeline_audio.get("success"):
+            raise RuntimeError(timeline_audio.get("error", "timeline render failed"))
     except Exception as e:
-        raise HTTPException(500, detail=f"WAV merge failed: {e}")
+        raise HTTPException(500, detail=f"Timeline render failed: {e}")
 
     # Write metadata
     metadata = {
@@ -433,6 +446,7 @@ async def finalize_session(session_id: str, request: Request,
         "model_size": model_size,
         "model_id": model_id,
         "run_diarization": run_diarization,
+        "diarization_policy": diarization_policy,
         "speaker_count": speaker_count,
         "force_transcribe_only": body.get("force_transcribe_only", False),
         "session_integrity": body.get("session_integrity"),
@@ -446,9 +460,10 @@ async def finalize_session(session_id: str, request: Request,
     atomic_write_json(str(sd / "metadata.json"), metadata)
 
     # Update session state
-    update_session_meta(session_id, {
+    session_updates = {
         "state": "finalized",
         "run_diarization": run_diarization,
+        "diarization_policy": diarization_policy,
         "speaker_count": speaker_count,
         "language": language,
         "allowed_languages": allowed_languages,
@@ -456,14 +471,21 @@ async def finalize_session(session_id: str, request: Request,
         "transcription_mode": transcription_mode,
         "model_size": model_size,
         "model_id": model_id,
+        "force_transcribe_only": body.get("force_transcribe_only", False),
+        "session_integrity": body.get("session_integrity"),
+        "language_candidates": language_candidates,
+        "language_selection_strategy": language_selection_strategy,
         "finalize_requested_at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    update_session_meta(session_id, session_updates)
+    merged_meta = (get_session_meta(session_id) or {}).copy()
+    merged_meta.update(session_updates)
 
     # Update status
     update_status(session_id, "uploaded")
 
     # Enqueue job
-    _enqueue_job(session_id, meta, body)
+    _enqueue_job(session_id, merged_meta, body)
 
     return {
         "session_id": session_id,
@@ -1116,6 +1138,13 @@ def _get_redis():
         return None
 
 
+def _body_or_meta(meta: dict, body: dict, key: str, default=None):
+    if key in body and body.get(key) is not None:
+        return body.get(key)
+    value = meta.get(key)
+    return default if value is None else value
+
+
 def _enqueue_job(session_id: str, meta: dict, body: dict):
     """Enqueue a transcription job to Redis."""
     r = _get_redis()
@@ -1123,8 +1152,10 @@ def _enqueue_job(session_id: str, meta: dict, body: dict):
         logger.warning("Redis unavailable, job not enqueued")
         return
 
-    model_size = meta.get("model_size", body.get("model_size", "auto"))
-    model_id = meta.get("model_id") or body.get("model_id")
+    model_size = _body_or_meta(meta, body, "model_size", "auto")
+    model_id = _body_or_meta(meta, body, "model_id")
+    diarization_policy = str(_body_or_meta(meta, body, "diarization_policy", "auto")).strip().lower() or "auto"
+    run_diarization = diarization_policy == "forced"
 
     # Determine job type: use canonical pipeline for "auto" without specific model
     if model_size == "auto" and not model_id:
@@ -1135,17 +1166,19 @@ def _enqueue_job(session_id: str, meta: dict, body: dict):
     job = {
         "job_type": job_type,
         "session_id": session_id,
-        "language": meta.get("language", body.get("language", "auto")),
-        "allowed_languages": meta.get("allowed_languages", body.get("allowed_languages")),
-        "forced_language": meta.get("forced_language", body.get("forced_language")),
-        "transcription_mode": meta.get("transcription_mode", body.get("transcription_mode", "verbatim_multilingual")),
+        "language": _body_or_meta(meta, body, "language", "auto"),
+        "allowed_languages": _body_or_meta(meta, body, "allowed_languages", []),
+        "forced_language": _body_or_meta(meta, body, "forced_language"),
+        "transcription_mode": _body_or_meta(meta, body, "transcription_mode", "verbatim_multilingual"),
         "model_size": model_size,
         "model_id": model_id,
-        "run_diarization": meta.get("run_diarization", body.get("run_diarization", False)),
-        "speaker_count": meta.get("speaker_count", body.get("speaker_count")),
-        "force_transcribe_only": body.get("force_transcribe_only", False),
-        "language_candidates": body.get("language_candidates"),
-        "language_selection_strategy": body.get("language_selection_strategy"),
+        "run_diarization": run_diarization,
+        "diarization_policy": diarization_policy,
+        "speaker_count": _body_or_meta(meta, body, "speaker_count"),
+        "force_transcribe_only": _body_or_meta(meta, body, "force_transcribe_only", False),
+        "session_integrity": _body_or_meta(meta, body, "session_integrity"),
+        "language_candidates": _body_or_meta(meta, body, "language_candidates"),
+        "language_selection_strategy": _body_or_meta(meta, body, "language_selection_strategy"),
     }
 
     cfg = get_config()

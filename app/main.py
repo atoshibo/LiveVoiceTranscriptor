@@ -16,12 +16,21 @@ from starlette.middleware.base import BaseHTTPMiddleware
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.api.api_v2 import _enqueue_job, router as api_v2_router
+from app.api.api_v2 import _enqueue_job, _read_worker_health, router as api_v2_router
 from app.api.auth import _extract_token
 from app.api.auth import require_auth_upload
 from app.core.config import get_config
 from app.core.tls import ensure_tls_assets
-from app.storage.session_store import create_session, get_session_meta, list_sessions, register_chunk, session_dir, update_session_meta, update_status
+from app.storage.session_store import (
+    cleanup_abandoned_draft_sessions,
+    create_session,
+    get_session_meta,
+    list_sessions,
+    register_chunk,
+    session_dir,
+    update_session_meta,
+    update_status,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -87,17 +96,40 @@ def _redis_diagnostics() -> dict:
 
 
 def _gpu_diagnostics() -> dict:
-    result = {"available": False, "error": None}
+    worker_health = _read_worker_health()
+    result = {
+        "available": bool(worker_health.get("gpu_available", False)),
+        "name": worker_health.get("gpu_name"),
+        "reason": worker_health.get("gpu_reason"),
+        "selected_device": worker_health.get("selected_device"),
+        "selected_compute_type": worker_health.get("selected_compute_type"),
+        "worker_started_at": worker_health.get("worker_started_at"),
+        "backend_status": worker_health.get("backend_status", {}),
+        "error": None,
+        "server_probe": {
+            "available": False,
+            "name": None,
+            "error": None,
+        },
+    }
     try:
         import torch
 
-        result["available"] = torch.cuda.is_available()
-        if result["available"]:
-            result["name"] = torch.cuda.get_device_name(0)
+        result["server_probe"]["available"] = torch.cuda.is_available()
+        if result["server_probe"]["available"]:
+            result["server_probe"]["name"] = torch.cuda.get_device_name(0)
+        if not worker_health:
+            result["available"] = result["server_probe"]["available"]
+            result["name"] = result["server_probe"]["name"]
+            result["reason"] = "server_cuda_probe"
     except ImportError:
-        result["error"] = "torch not installed"
+        result["server_probe"]["error"] = "torch not installed"
+        if not worker_health:
+            result["error"] = "torch not installed"
     except Exception as exc:
-        result["error"] = str(exc)
+        result["server_probe"]["error"] = str(exc)
+        if not worker_health:
+            result["error"] = str(exc)
     return result
 
 
@@ -106,6 +138,12 @@ async def startup():
     cfg = get_config()
     Path(cfg.storage.sessions_dir).mkdir(parents=True, exist_ok=True)
     logger.info("Sessions dir: %s", cfg.storage.sessions_dir)
+    cleanup_result = cleanup_abandoned_draft_sessions()
+    if cleanup_result.get("deleted_count"):
+        logger.info(
+            "Cleaned up %s abandoned draft session(s) on startup",
+            cleanup_result["deleted_count"],
+        )
     logger.info("Server: %s:%s tls=%s", cfg.server.host, cfg.server.port, cfg.server.tls_enabled)
     if cfg.server.tls_enabled:
         tls_info = ensure_tls_assets()
@@ -212,6 +250,7 @@ async def legacy_file_upload(
             "language": language,
             "model_size": model_size,
             "run_diarization": diarization,
+            "diarization_policy": "forced" if diarization else "off",
             "finalize_requested_at": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -223,6 +262,7 @@ async def legacy_file_upload(
             "language": language,
             "model_size": model_size,
             "run_diarization": diarization,
+            "diarization_policy": "forced" if diarization else "off",
         },
     )
     return {

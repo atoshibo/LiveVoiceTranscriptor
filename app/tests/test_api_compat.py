@@ -8,6 +8,7 @@ import os
 import sys
 import json
 import pytest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -76,6 +77,133 @@ class TestSessionCreation:
         result = create_session({})
         meta = get_session_meta(result["session_id"])
         assert meta["state"] == "created"
+
+
+class TestSessionListSummaries:
+    def test_list_sessions_sorted_by_activity_time(self, tmp_sessions_dir, monkeypatch):
+        from app.storage import session_store
+
+        ids = iter(["z-session", "a-session"])
+        monkeypatch.setattr(session_store.uuid, "uuid4", lambda: next(ids))
+
+        older = session_store.create_session({})
+        newer = session_store.create_session({})
+
+        now = datetime.now(timezone.utc)
+        session_store.update_session_meta(older["session_id"], {
+            "created_at": (now - timedelta(minutes=10)).isoformat(),
+        })
+        session_store.update_session_meta(newer["session_id"], {
+            "created_at": (now - timedelta(minutes=5)).isoformat(),
+        })
+
+        sessions = session_store.list_sessions(limit=10)
+        assert [item["session_id"] for item in sessions[:2]] == ["a-session", "z-session"]
+
+    def test_cleanup_removes_stale_empty_draft_sessions(self, tmp_sessions_dir):
+        from app.storage.session_store import create_session, cleanup_abandoned_draft_sessions, session_exists, update_session_meta
+
+        sid = create_session({})["session_id"]
+        update_session_meta(sid, {
+            "created_at": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        })
+
+        result = cleanup_abandoned_draft_sessions(max_age_minutes=120)
+
+        assert result["deleted_count"] == 1
+        assert sid in result["deleted_session_ids"]
+        assert session_exists(sid) is False
+
+    def test_cleanup_preserves_sessions_that_have_received_chunks(self, tmp_sessions_dir, make_wav_bytes):
+        from app.storage.session_store import (
+            cleanup_abandoned_draft_sessions,
+            create_session,
+            register_chunk,
+            session_dir,
+            session_exists,
+            update_session_meta,
+        )
+
+        sid = create_session({})["session_id"]
+        sd = session_dir(sid)
+        (sd / "chunks" / "chunk_0000.wav").write_bytes(make_wav_bytes(duration_s=0.1))
+        register_chunk(sid, 0, {
+            "chunk_index": 0,
+            "chunk_started_ms": 0,
+            "chunk_duration_ms": 100,
+        })
+        update_session_meta(sid, {
+            "created_at": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        })
+
+        result = cleanup_abandoned_draft_sessions(max_age_minutes=120)
+
+        assert sid not in result["deleted_session_ids"]
+        assert session_exists(sid) is True
+
+    def test_list_sessions_auto_cleans_stale_empty_drafts(self, tmp_sessions_dir):
+        from app.storage.session_store import create_session, list_sessions, session_exists, update_session_meta
+
+        stale_sid = create_session({})["session_id"]
+        fresh_sid = create_session({})["session_id"]
+        update_session_meta(stale_sid, {
+            "created_at": (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat(),
+        })
+        update_session_meta(fresh_sid, {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        sessions = list_sessions(limit=10)
+        session_ids = [item["session_id"] for item in sessions]
+
+        assert stale_sid not in session_ids
+        assert fresh_sid in session_ids
+        assert session_exists(stale_sid) is False
+
+    def test_grouped_sessions_use_worker_state_for_completed_runs(self, tmp_sessions_dir):
+        from app.storage.session_store import (
+            create_session,
+            list_sessions_grouped,
+            update_session_meta,
+            update_status,
+        )
+
+        sid = create_session({"source_type": "device_import"})["session_id"]
+        update_session_meta(sid, {"state": "finalized"})
+        update_status(sid, "done")
+
+        grouped = list_sessions_grouped()
+        summary = next(
+            sess
+            for group in grouped["groups"]
+            for sess in group["sessions"]
+            if sess["session_id"] == sid
+        )
+
+        assert summary["state"] == "done"
+        assert summary["backend_outcome"] == "completed"
+
+    def test_grouped_sessions_surface_finalized_pending_as_queued(self, tmp_sessions_dir):
+        from app.storage.session_store import (
+            create_session,
+            list_sessions_grouped,
+            update_session_meta,
+            update_status,
+        )
+
+        sid = create_session({"source_type": "device_import"})["session_id"]
+        update_session_meta(sid, {"state": "finalized"})
+        update_status(sid, "uploaded")
+
+        grouped = list_sessions_grouped()
+        summary = next(
+            sess
+            for group in grouped["groups"]
+            for sess in group["sessions"]
+            if sess["session_id"] == sid
+        )
+
+        assert summary["state"] == "queued"
 
 
 class TestStatusMapping:
@@ -187,3 +315,42 @@ class TestModelSizeValidation:
         from app.models.registry import resolve_model_id
         assert resolve_model_id("faster-whisper:medium") == "faster-whisper:medium"
         assert resolve_model_id("nemo-asr:parakeet-tdt-0.6b-v3") == "nemo-asr:parakeet-tdt-0.6b-v3"
+
+
+class TestJobEnqueueContract:
+    def test_enqueue_job_uses_latest_finalize_contract(self, monkeypatch):
+        from app.api import api_v2
+
+        pushed = []
+
+        class DummyRedis:
+            def rpush(self, queue, payload):
+                pushed.append((queue, payload))
+
+        monkeypatch.setattr(api_v2, "_get_redis", lambda: DummyRedis())
+        monkeypatch.setattr(api_v2, "update_status", lambda *args, **kwargs: None)
+
+        meta = {
+            "language": "auto",
+            "model_size": "small",
+            "allowed_languages": ["fr"],
+            "forced_language": None,
+            "transcription_mode": "verbatim_multilingual",
+            "diarization_policy": "forced",
+            "speaker_count": 2,
+        }
+        body = {
+            "model_size": "small",
+            "allowed_languages": ["fr"],
+            "speaker_count": 2,
+        }
+
+        api_v2._enqueue_job("session-1", meta, body)
+
+        assert len(pushed) == 1
+        payload = json.loads(pushed[0][1])
+        assert payload["job_type"] == "v2"
+        assert payload["model_size"] == "small"
+        assert payload["allowed_languages"] == ["fr"]
+        assert payload["diarization_policy"] == "forced"
+        assert payload["run_diarization"] is True

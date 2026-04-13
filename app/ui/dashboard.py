@@ -458,8 +458,9 @@ function loadDiagnostics(){
       <div class="kv"><span class="k">Queue Length</span><span class="v">${d.redis?.queue_len||0}</span></div>
       ${d.redis?.error?`<div class="kv"><span class="k">Error</span><span class="v" style="color:var(--red)">${d.redis.error}</span></div>`:''}
       <h3 style="margin-top:12px">GPU</h3>
-      <div class="kv"><span class="k">Available</span><span class="v">${d.gpu?.available?'Yes':'No'}</span></div>
+      <div class="kv"><span class="k">Available</span><span class="v">${d.gpu?.available?'Yes':'No'}${d.gpu?.reason?` (${d.gpu.reason})`:''}</span></div>
       ${d.gpu?.name?`<div class="kv"><span class="k">Name</span><span class="v">${d.gpu.name}</span></div>`:''}
+      ${d.gpu?.selected_device?`<div class="kv"><span class="k">Worker Device</span><span class="v">${d.gpu.selected_device}${d.gpu.selected_compute_type?` / ${d.gpu.selected_compute_type}`:''}</span></div>`:''}
       <h3 style="margin-top:12px">Storage</h3>
       <div class="kv"><span class="k">Sessions Dir</span><span class="v mono">${d.sessions_dir||'?'}</span></div>`;
   });

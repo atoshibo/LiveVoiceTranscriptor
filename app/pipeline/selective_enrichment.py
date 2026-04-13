@@ -22,7 +22,7 @@ from typing import List, Dict, Optional
 
 from app.core.config import get_config
 from app.core.atomic_io import atomic_write_json, safe_read_json
-from app.storage.session_store import session_dir
+from app.storage.session_store import session_dir, get_session_meta
 
 logger = logging.getLogger(__name__)
 
@@ -158,10 +158,12 @@ def run_selective_enrichment(session_id: str, segments: List[Dict],
     3. Update canonical segments
     """
     sd = session_dir(session_id)
-    meta = safe_read_json(str(sd / "v2_session.json")) or {}
+    meta = get_session_meta(session_id) or safe_read_json(str(sd / "v2_session.json")) or {}
 
-    diarization_policy = "auto"
-    if meta.get("run_diarization"):
+    diarization_policy = str(meta.get("diarization_policy", "auto")).strip().lower() or "auto"
+    if diarization_policy not in {"auto", "off", "forced"}:
+        diarization_policy = "auto"
+    if meta.get("run_diarization") and diarization_policy == "auto":
         diarization_policy = "forced"
 
     speaker_turns = None
@@ -184,8 +186,12 @@ def run_selective_enrichment(session_id: str, segments: List[Dict],
     else:
         logger.info(f"Diarization not justified for {session_id}")
 
-    # Assign speakers
-    segments = assign_speakers_to_segments(segments, speaker_turns or [])
+    # Only attach speakers when selective diarization produced real evidence.
+    if speaker_turns:
+        segments = assign_speakers_to_segments(segments, speaker_turns)
+    else:
+        for seg in segments:
+            seg.setdefault("speaker", None)
 
     # Update canonical segments file
     atomic_write_json(str(sd / "canonical" / "canonical_segments.json"), {
@@ -201,10 +207,21 @@ def run_selective_enrichment(session_id: str, segments: List[Dict],
         logger.warning("Failed to refresh canonical transcript surfaces after enrichment: %s", exc)
 
     result = {
+        "diarization_policy": diarization_policy,
         "diarization_status": diarization_status,
-        "speaker_count": len(set(s.get("speaker", "") for s in segments)),
+        "speaker_count": len({s.get("speaker") for s in segments if s.get("speaker")}),
         "turn_count": len(speaker_turns) if speaker_turns else 0,
     }
 
-    stage.commit(["canonical_segments.json", "transcript.txt", "provenance.json", "final_transcript.json"])
+    artifacts = [
+        "canonical_segments.json",
+        "transcript.txt",
+        "provenance.json",
+        "provisional_partial.json",
+        "stabilized_partial.json",
+        "final_transcript.json",
+    ]
+    if speaker_turns:
+        artifacts.append("speaker_turns.json")
+    stage.commit(artifacts)
     return result

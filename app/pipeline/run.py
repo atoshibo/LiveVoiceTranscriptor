@@ -11,19 +11,18 @@ Manages:
         stage_meta.json          -- StageRun status, timestamps, artifacts
         <artifact files>
 
-Canonical V1 stages (turbo replaced by parakeet):
+Canonical stages aligned to the pipeline specification:
   1. normalize_audio
-  2. first_pass_medium
-  3. speaker_diarization
-  4. acoustic_triage
-  5. decode_lattice
-  6. candidate_asr_large_v3
-  7. candidate_asr_parakeet       <-- replaces candidate_asr_turbo_hf
-  8. stripe_grouping
-  9. reconciliation
-  10. canonical_assembly
-  11. selective_enrichment
-  12. derived_outputs
+  2. acoustic_triage
+  3. decode_lattice
+  4. first_pass_medium
+  5. candidate_asr_large_v3
+  6. candidate_asr_parakeet
+  7. stripe_grouping
+  8. reconciliation
+  9. canonical_assembly
+  10. selective_enrichment
+  11. derived_outputs
 """
 import os
 import uuid
@@ -50,13 +49,12 @@ RUN_RUNNING = "running"
 RUN_DONE = "done"
 RUN_ERROR = "error"
 
-# Canonical V1 stages - Parakeet replaces Turbo
+# Canonical stages - full-session ASR is intentionally excluded before triage.
 CANONICAL_V1_STAGES = [
     "normalize_audio",
-    "first_pass_medium",
-    "speaker_diarization",
     "acoustic_triage",
     "decode_lattice",
+    "first_pass_medium",
     "candidate_asr_large_v3",
     "candidate_asr_parakeet",      # Was: candidate_asr_turbo_hf
     "stripe_grouping",
