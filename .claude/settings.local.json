@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from app.core.config import get_config, reset_config; reset_config\\(\\); cfg = get_config\\(\\); print\\(type\\(cfg.model_paths\\)\\); print\\(cfg.model_paths.diarization_path\\)\")"
+    ]
+  }
+}

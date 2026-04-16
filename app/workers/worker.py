@@ -3,7 +3,7 @@ Background Worker - Redis-backed job processor.
 
 Single-threaded to serialize GPU use. Processes:
   - v2_canonical: Full canonical pipeline
-  - v2_partial: Quick partial transcript for live preview
+  - v2_canonical_live: Incremental canonical lexical preview during recording
   - v2_retranscribe: Re-transcription with different model
   - v2 / legacy: Basic single-model transcription
 
@@ -80,28 +80,103 @@ def _session_language_context(session_id: str, job_data: dict) -> dict:
     }
 
 
-def _select_candidate_b_model(language_ctx: dict) -> tuple[Optional[str], Optional[str]]:
+def _first_pass_language_evidence(session_id: str) -> dict:
+    """Summarize successful first-pass language evidence for candidate-B routing."""
+    cand_dir = session_dir(session_id) / "candidates"
+    counts: Dict[str, int] = {}
+    success_count = 0
+
+    if not cand_dir.is_dir():
+        return {"success_count": 0, "language_counts": {}, "dominant_language": None}
+
+    for path in cand_dir.glob("cand_*.json"):
+        candidate = safe_read_json(str(path)) or {}
+        if candidate.get("model_id") != DEFAULT_FIRST_PASS:
+            continue
+        if not candidate.get("confidence_features", {}).get("success"):
+            continue
+        success_count += 1
+        detected = str(candidate.get("language_evidence", {}).get("detected_language") or "").strip().lower()
+        if detected:
+            counts[detected] = counts.get(detected, 0) + 1
+
+    dominant_language = None
+    if counts:
+        dominant_language = max(sorted(counts), key=lambda item: counts[item])
+
+    return {
+        "success_count": success_count,
+        "language_counts": counts,
+        "dominant_language": dominant_language,
+    }
+
+
+def _select_candidate_b_model(language_ctx: dict, session_id: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
     reg = get_registry(refresh=True)
     forced = language_ctx.get("forced_language")
     allowed = language_ctx.get("allowed_languages") or []
     transcription_mode = language_ctx.get("transcription_mode", "verbatim_multilingual")
+    parakeet = reg.get(DEFAULT_CANDIDATE_B)
+    canary_id = "nemo-asr:canary-1b-v2"
+    canary = reg.get(canary_id)
 
     english_only = forced == "en" or allowed == ["en"] or (
         not forced and transcription_mode != "verbatim_multilingual" and allowed == ["en"]
     )
 
     if english_only:
-        info = reg.get(DEFAULT_CANDIDATE_B)
-        if info and info.is_usable:
+        if parakeet and parakeet.is_usable:
             return DEFAULT_CANDIDATE_B, "english_restricted_session"
         return None, "parakeet_unavailable_for_english_session"
 
-    canary_id = "nemo-asr:canary-1b-v2"
-    canary = reg.get(canary_id)
+    explicit_non_english = bool(forced and forced != "en") or any(lang != "en" for lang in allowed)
+    if explicit_non_english:
+        if canary and canary.is_usable:
+            return canary_id, "explicit_non_english_session_routed_to_canary"
+        return None, "canary_unavailable_for_explicit_non_english_session"
+
+    first_pass_evidence = _first_pass_language_evidence(session_id) if session_id else {}
+    dominant_language = first_pass_evidence.get("dominant_language")
+
+    if dominant_language == "en":
+        if parakeet and parakeet.is_usable:
+            return DEFAULT_CANDIDATE_B, "first_pass_detected_english"
+        if canary and canary.is_usable:
+            return canary_id, "first_pass_detected_english_but_parakeet_unavailable"
+        return None, "no_candidate_b_available_for_english_session"
+
+    if dominant_language and dominant_language != "en":
+        if canary and canary.is_usable:
+            return canary_id, f"first_pass_detected_{dominant_language}"
+        return None, f"canary_unavailable_for_{dominant_language}"
+
+    if parakeet and parakeet.is_usable:
+        return DEFAULT_CANDIDATE_B, "auto_session_defaulted_to_parakeet_pending_language_evidence"
     if canary and canary.is_usable:
-        return canary_id, "multilingual_candidate_b_routed_to_canary"
+        return canary_id, "auto_session_fallback_to_canary"
 
     return None, "candidate_b_skipped_for_multilingual_session"
+
+
+def _candidate_b_execution_language_ctx(
+    candidate_b_model: Optional[str],
+    candidate_b_reason: Optional[str],
+    language_ctx: dict,
+) -> dict:
+    """Translate routing decisions into provider-safe execution language hints."""
+    effective = {
+        "language": language_ctx.get("forced_language") or language_ctx.get("requested_language"),
+        "allowed_languages": list(language_ctx.get("allowed_languages") or []),
+        "forced_language": language_ctx.get("forced_language"),
+        "transcription_mode": language_ctx.get("transcription_mode", "verbatim_multilingual"),
+    }
+
+    if candidate_b_model == DEFAULT_CANDIDATE_B:
+        effective["language"] = "en"
+        effective["allowed_languages"] = ["en"]
+        effective["forced_language"] = "en"
+
+    return effective
 
 
 def _get_redis():
@@ -118,43 +193,91 @@ def _get_redis():
 
 
 def _get_gpu_diagnostics() -> dict:
-    """Probe GPU health."""
+    """Probe GPU health with full CUDA runtime diagnostics."""
+    cfg = get_config()
     result = {
         "gpu_available": False,
         "gpu_name": None,
         "gpu_reason": "not_checked",
+        "config": {
+            "whisper_device": cfg.worker.whisper_device,
+            "whisper_compute_type": cfg.worker.whisper_compute_type,
+            "whisper_compute_type_fallbacks": cfg.worker.whisper_compute_type_fallbacks,
+            "strict_cuda": cfg.worker.strict_cuda,
+            "cuda_device_index": cfg.worker.cuda_device_index,
+        },
         "backend_status": {
             "torch_cuda_available": False,
+            "torch_cuda_device_count": 0,
             "ctranslate2_cuda_device_count": 0,
+            "faster_whisper_importable": False,
+            "nemo_importable": False,
         },
     }
+
+    # --- torch CUDA probe ---
     try:
         import torch
+        result["backend_status"]["torch_version"] = torch.__version__
+        result["backend_status"]["torch_cuda_built"] = torch.backends.cuda.is_built() if hasattr(torch.backends, 'cuda') else "unknown"
         if torch.cuda.is_available():
             result["gpu_available"] = True
-            result["gpu_name"] = torch.cuda.get_device_name(0)
+            idx = cfg.worker.cuda_device_index
+            result["gpu_name"] = torch.cuda.get_device_name(idx)
             result["gpu_reason"] = "cuda_available"
-            props = torch.cuda.get_device_properties(0)
+            props = torch.cuda.get_device_properties(idx)
             result["memory_total_mb"] = round(props.total_memory / 1024 / 1024)
+            result["cuda_version"] = torch.version.cuda
             result["backend_status"]["torch_cuda_available"] = True
+            result["backend_status"]["torch_cuda_device_count"] = torch.cuda.device_count()
         else:
-            result["gpu_reason"] = "cuda_not_available"
+            result["gpu_reason"] = "torch_cuda_not_available"
     except ImportError:
         result["gpu_reason"] = "torch_not_installed"
     except Exception as e:
-        result["gpu_reason"] = str(e)
+        result["gpu_reason"] = f"torch_probe_error:{e}"
 
+    # --- ctranslate2 CUDA probe ---
     try:
         import ctranslate2
-
+        result["backend_status"]["ctranslate2_version"] = getattr(ctranslate2, "__version__", "unknown")
         cuda_devices = int(ctranslate2.get_cuda_device_count())
         result["backend_status"]["ctranslate2_cuda_device_count"] = cuda_devices
         if cuda_devices > 0 and not result["gpu_available"]:
             result["gpu_available"] = True
             result["gpu_reason"] = "ctranslate2_cuda_available"
             result["gpu_name"] = result.get("gpu_name") or "CUDA device via CTranslate2"
-    except Exception:
-        pass
+    except ImportError:
+        result["backend_status"]["ctranslate2_error"] = "not_installed"
+    except Exception as e:
+        result["backend_status"]["ctranslate2_error"] = str(e)
+
+    # --- faster-whisper import probe ---
+    try:
+        import faster_whisper
+        result["backend_status"]["faster_whisper_importable"] = True
+        result["backend_status"]["faster_whisper_version"] = getattr(faster_whisper, "__version__", "unknown")
+    except ImportError as e:
+        result["backend_status"]["faster_whisper_error"] = str(e)
+    except Exception as e:
+        result["backend_status"]["faster_whisper_error"] = str(e)
+
+    # --- NeMo import probe ---
+    try:
+        import nemo.collections.asr  # noqa: F401
+        result["backend_status"]["nemo_importable"] = True
+    except ImportError:
+        result["backend_status"]["nemo_error"] = "not_installed"
+    except Exception as e:
+        result["backend_status"]["nemo_error"] = str(e)
+
+    # --- Resolve effective runtime ---
+    from app.pipeline.asr_executor import _resolve_gpu_runtime
+    runtime = _resolve_gpu_runtime(cfg)
+    result["effective_device"] = runtime["device"]
+    result["effective_compute_type"] = runtime["compute_type"]
+    result["device_selection_method"] = runtime["method"]
+
     return result
 
 
@@ -165,9 +288,6 @@ def _write_worker_health(gpu_info: dict):
     data = {
         **gpu_info,
         "worker_started_at": datetime.now(timezone.utc).isoformat(),
-        "selected_device": "cuda" if gpu_info.get("gpu_available") else "cpu",
-        "selected_compute_type": "float16" if gpu_info.get("gpu_available") else "int8",
-        "strict_cuda": cfg.worker.strict_cuda,
     }
     try:
         Path(health_path).parent.mkdir(parents=True, exist_ok=True)
@@ -192,6 +312,20 @@ def _unload_all_vram():
         pass
 
 
+def _unload_faster_whisper_only():
+    """Unload faster-whisper/ctranslate2 without touching NeMo cache.
+
+    Used between faster-whisper stages and NeMo stages to avoid the
+    ctranslate2↔PyTorch CUDA allocator conflict while preserving
+    NeMo model cache for reuse across windows.
+    """
+    try:
+        from app.pipeline.asr_executor import unload_faster_whisper
+        unload_faster_whisper()
+    except Exception:
+        pass
+
+
 def _derive_action_hint(error_msg: str) -> str:
     """Map CUDA errors to human-readable hints."""
     msg = str(error_msg).lower()
@@ -202,6 +336,426 @@ def _derive_action_hint(error_msg: str) -> str:
     if "no such file" in msg or "not found" in msg:
         return "Required file missing. Check model paths and audio files."
     return "Internal error. Check logs for details."
+
+
+def _live_stage_root(session_id: str) -> Path:
+    return session_dir(session_id) / "pipeline" / "live_preview"
+
+
+class _LiveStage:
+    """Minimal stage tracker for canonical live preview runs.
+
+    Live processing must not interfere with the authoritative PipelineRun used
+    for finalized sessions, but we still want per-stage diagnostics on disk and
+    a writable stage_dir for routing artifacts.
+    """
+
+    def __init__(self, session_id: str, name: str):
+        self.name = name
+        self.session_id = session_id
+        self.root = _live_stage_root(session_id)
+        self.stage_dir = self.root / "stages" / name
+        self.stage_dir.mkdir(parents=True, exist_ok=True)
+        self.status = "running"
+        self.started_at = datetime.now(timezone.utc).isoformat()
+        self.finished_at: Optional[str] = None
+        self.error: Optional[str] = None
+        self.artifacts: list[str] = []
+        self.actual_model: Optional[str] = None
+        self.routing_reason: Optional[str] = None
+        self._save()
+
+    def commit(self, artifacts=None):
+        self.status = "done"
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.artifacts = list(artifacts or [])
+        self._save()
+
+    def commit_with_fallback(self, artifacts=None, reason: str = ""):
+        self.status = "done"
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.artifacts = list(artifacts or [])
+        self.error = f"fallback: {reason}" if reason else "fallback"
+        self._save()
+
+    def commit_degraded(self, reason: str, artifacts=None):
+        self.status = "degraded"
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.artifacts = list(artifacts or [])
+        self.error = reason
+        self._save()
+
+    def fail(self, error: str):
+        self.status = "error"
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.error = error
+        self._save()
+
+    def skip(self, reason: str = ""):
+        self.status = "skipped"
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.error = reason
+        self._save()
+
+    def _save(self):
+        atomic_write_json(
+            str(self.stage_dir / "stage_meta.json"),
+            {
+                "name": self.name,
+                "status": self.status,
+                "started_at": self.started_at,
+                "finished_at": self.finished_at,
+                "error": self.error,
+                "artifacts": self.artifacts,
+                "actual_model": self.actual_model,
+                "routing_reason": self.routing_reason,
+                "live_preview": True,
+            },
+        )
+
+
+def _write_live_preview_state(
+    session_id: str,
+    chunk_count: int,
+    audio_duration_ms: int,
+    surfaces: Dict[str, Any] | None,
+) -> None:
+    canonical_dir = session_dir(session_id) / "canonical"
+    stabilized_segments = (surfaces or {}).get("stabilized_segments") or []
+    provisional_segments = [
+        seg for seg in ((surfaces or {}).get("segments") or [])
+        if seg.get("stabilization_state") != "stabilized"
+    ]
+    atomic_write_json(
+        str(canonical_dir / "live_progress.json"),
+        {
+            "session_id": session_id,
+            "live_preview": True,
+            "chunk_count_at_run": chunk_count,
+            "audio_duration_ms": audio_duration_ms,
+            "stabilized_until_ms": max((seg.get("end_ms", 0) for seg in stabilized_segments), default=0),
+            "open_tail_start_ms": min((seg.get("start_ms", 0) for seg in provisional_segments), default=None),
+            "stabilized_segment_count": len(stabilized_segments),
+            "provisional_segment_count": len(provisional_segments),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+def _clear_live_lock(session_id: str) -> None:
+    lock = session_dir(session_id) / "live_canonical_pending"
+    if lock.exists():
+        try:
+            lock.unlink()
+        except OSError:
+            pass
+
+
+def process_canonical_live_job(job_data: dict):
+    """Run the lexical canonical pipeline incrementally during an open stream.
+
+    This intentionally stops after canonical assembly.  The finalized session
+    still performs the authoritative full pass (including enrichment/memory),
+    but live users get true canonical geometry instead of a fake preview path.
+    """
+    session_id = job_data["session_id"]
+    sd = session_dir(session_id)
+    logger.info("Starting canonical live pipeline for %s", session_id)
+
+    try:
+        status = get_status(session_id) or {}
+        meta = get_session_meta(session_id) or {}
+        if status.get("status") in ("done", "cancelled"):
+            logger.info("Skipping live canonical for %s; status=%s", session_id, status.get("status"))
+            return
+        if meta.get("state") == "finalized" and (sd / "canonical" / "final_transcript.json").is_file():
+            logger.info("Skipping live canonical for %s; finalized output already present", session_id)
+            return
+
+        chunk_paths = get_chunk_paths(session_id)
+        if len(chunk_paths) < max(1, get_config().worker.partial_every_n_chunks):
+            return
+
+        update_status(
+            session_id,
+            "running",
+            live_preview=True,
+            live_chunk_count=len(chunk_paths),
+            live_generated_at=datetime.now(timezone.utc).isoformat(),
+        )
+        update_progress(session_id, "canonical_live_initializing", 0)
+
+        language_ctx = _session_language_context(session_id, job_data)
+        language = language_ctx["forced_language"] or language_ctx["requested_language"]
+
+        # Stage 1: normalize audio
+        update_progress(session_id, "normalize_audio", 5)
+        stage = _LiveStage(session_id, "normalize_audio")
+        from app.pipeline.ingest import run_ingest_stage
+        ingest_result = run_ingest_stage(session_id, stage)
+        audio_duration_ms = ingest_result["audio_duration_ms"]
+        normalized_audio = str(sd / "normalized" / "audio.wav")
+
+        # Stage 2: acoustic triage
+        update_progress(session_id, "acoustic_triage", 18)
+        speech_islands = None
+        stage = _LiveStage(session_id, "acoustic_triage")
+        try:
+            from app.pipeline.acoustic_triage import run_acoustic_triage
+            run_acoustic_triage(session_id, normalized_audio, audio_duration_ms, stage)
+            islands_data = safe_read_json(str(sd / "triage" / "speech_islands.json"))
+            speech_islands = (islands_data or {}).get("islands", [])
+        except Exception as e:
+            stage.commit_with_fallback([], f"triage_error: {e}")
+
+        # Stage 3: decode lattice, but do not create truncated trailing windows
+        update_progress(session_id, "decode_lattice", 28)
+        stage = _LiveStage(session_id, "decode_lattice")
+        from app.pipeline.decode_lattice import run_decode_lattice
+        lattice_result = run_decode_lattice(
+            session_id,
+            normalized_audio,
+            audio_duration_ms,
+            speech_islands,
+            stage,
+            allow_trailing_partial_window=False,
+        )
+        windows = lattice_result.get("windows", [])
+
+        # Stage 4: first-pass ASR
+        update_progress(session_id, "first_pass_medium", 36)
+        stage = _LiveStage(session_id, "first_pass_medium")
+        stage.actual_model = DEFAULT_FIRST_PASS
+        stage.routing_reason = "default_first_pass"
+        from app.pipeline.asr_executor import run_asr_execution
+        summary = run_asr_execution(
+            session_id,
+            windows,
+            [DEFAULT_FIRST_PASS],
+            language=language,
+            allowed_languages=language_ctx["allowed_languages"],
+            forced_language=language_ctx["forced_language"],
+            transcription_mode=language_ctx["transcription_mode"],
+            progress_callback=lambda p: update_progress(session_id, "first_pass_medium", 36 + int(p * 0.08)),
+        )
+        atomic_write_json(str(stage.stage_dir / "first_pass_routing.json"), {
+            "selected_model": DEFAULT_FIRST_PASS,
+            "language_context": language_ctx,
+            "asr_summary": summary,
+        })
+        model_stats = (summary or {}).get("candidates_by_model", {}).get(DEFAULT_FIRST_PASS, {})
+        if model_stats.get("success", 0) == 0 and model_stats.get("count", 0) > 0:
+            stage.commit_degraded(
+                f"all {model_stats['count']} windows failed for {DEFAULT_FIRST_PASS}",
+                ["first_pass_routing.json"],
+            )
+        else:
+            stage.commit(["first_pass_routing.json"])
+
+        _unload_all_vram()
+
+        first_pass_evidence = _first_pass_language_evidence(session_id)
+        detected_language = first_pass_evidence.get("dominant_language")
+        effective_language = language
+        if not effective_language and detected_language:
+            effective_language = detected_language
+
+        # Stage 5: candidate A
+        update_progress(session_id, "candidate_asr_large_v3", 46)
+        stage = _LiveStage(session_id, "candidate_asr_large_v3")
+        stage.actual_model = DEFAULT_CANDIDATE_A
+        stage.routing_reason = "default_candidate_a"
+        summary = run_asr_execution(
+            session_id,
+            windows,
+            [DEFAULT_CANDIDATE_A],
+            language=effective_language,
+            allowed_languages=language_ctx["allowed_languages"],
+            forced_language=language_ctx["forced_language"],
+            transcription_mode=language_ctx["transcription_mode"],
+            progress_callback=lambda p: update_progress(session_id, "candidate_asr_large_v3", 46 + int(p * 0.1)),
+        )
+        atomic_write_json(str(stage.stage_dir / "candidate_a_routing.json"), {
+            "selected_model": DEFAULT_CANDIDATE_A,
+            "language_context": language_ctx,
+            "asr_summary": summary,
+        })
+        model_stats = (summary or {}).get("candidates_by_model", {}).get(DEFAULT_CANDIDATE_A, {})
+        if model_stats.get("success", 0) == 0 and model_stats.get("count", 0) > 0:
+            stage.commit_degraded(
+                f"all {model_stats['count']} windows failed for {DEFAULT_CANDIDATE_A}",
+                ["candidate_a_routing.json"],
+            )
+        else:
+            stage.commit(["candidate_a_routing.json"])
+
+        _unload_faster_whisper_only()
+
+        # Stage 6: candidate B
+        update_progress(session_id, "candidate_asr_secondary", 58)
+        stage = _LiveStage(session_id, "candidate_asr_secondary")
+        candidate_b_model, candidate_b_reason = _select_candidate_b_model(language_ctx, session_id=session_id)
+        candidate_b_language_ctx = _candidate_b_execution_language_ctx(
+            candidate_b_model,
+            candidate_b_reason,
+            language_ctx,
+        )
+        stage.actual_model = candidate_b_model
+        stage.routing_reason = candidate_b_reason
+        if candidate_b_model:
+            summary = run_asr_execution(
+                session_id,
+                windows,
+                [candidate_b_model],
+                language=candidate_b_language_ctx["language"],
+                allowed_languages=candidate_b_language_ctx["allowed_languages"],
+                forced_language=candidate_b_language_ctx["forced_language"],
+                transcription_mode=candidate_b_language_ctx["transcription_mode"],
+                progress_callback=lambda p: update_progress(session_id, "candidate_asr_secondary", 58 + int(p * 0.1)),
+            )
+            atomic_write_json(str(stage.stage_dir / "candidate_b_routing.json"), {
+                "selected_model": candidate_b_model,
+                "reason": candidate_b_reason,
+                "language_context": language_ctx,
+                "effective_language_context": candidate_b_language_ctx,
+                "first_pass_language_evidence": first_pass_evidence,
+                "asr_summary": summary,
+            })
+            model_stats = (summary or {}).get("candidates_by_model", {}).get(candidate_b_model, {})
+            if model_stats.get("success", 0) == 0 and model_stats.get("count", 0) > 0:
+                stage.commit_degraded(
+                    f"all {model_stats['count']} windows failed for {candidate_b_model}",
+                    ["candidate_b_routing.json"],
+                )
+            else:
+                stage.commit(["candidate_b_routing.json"])
+        else:
+            atomic_write_json(str(stage.stage_dir / "candidate_b_routing.json"), {
+                "selected_model": None,
+                "reason": candidate_b_reason,
+                "language_context": language_ctx,
+                "effective_language_context": candidate_b_language_ctx,
+                "first_pass_language_evidence": first_pass_evidence,
+            })
+            stage.commit_with_fallback(["candidate_b_routing.json"], candidate_b_reason)
+
+        _unload_all_vram()
+
+        cand_dir = sd / "candidates"
+        successful_candidates = 0
+        total_candidates = 0
+        if cand_dir.is_dir():
+            for f in cand_dir.glob("cand_*.json"):
+                c = safe_read_json(str(f))
+                if c and any(w.get("window_id") == c.get("window_id") for w in windows):
+                    total_candidates += 1
+                    if c.get("confidence_features", {}).get("success"):
+                        successful_candidates += 1
+        if successful_candidates == 0:
+            raise RuntimeError(
+                f"Live canonical ASR failed — zero successful candidates out of {total_candidates} attempted."
+            )
+
+        # Stage 7: stripe grouping
+        update_progress(session_id, "stripe_grouping", 70)
+        stage = _LiveStage(session_id, "stripe_grouping")
+        from app.pipeline.stripe_grouping import run_stripe_grouping
+        grouping_result = run_stripe_grouping(session_id, windows, audio_duration_ms, stage)
+        stripe_packets = grouping_result.get("stripes", [])
+
+        # Stage 8: reconciliation
+        update_progress(session_id, "reconciliation", 79)
+        stage = _LiveStage(session_id, "reconciliation")
+        from app.pipeline.reconciliation import run_reconciliation
+        reconciliation_result = run_reconciliation(session_id, stripe_packets, stage)
+
+        _unload_all_vram()
+
+        # Stage 9: canonical assembly, but never flush trailing single-support stripe as final.
+        update_progress(session_id, "canonical_assembly", 87)
+        stage = _LiveStage(session_id, "canonical_assembly")
+        from app.pipeline.canonical_assembly import run_canonical_assembly, build_transcript_surfaces
+        if reconciliation_result.get("records"):
+            assembly_result = run_canonical_assembly(
+                session_id,
+                reconciliation_result,
+                stripe_packets,
+                stage,
+                finalize_last_boundary=False,
+                emit_final_surface=False,
+            )
+        else:
+            surfaces = build_transcript_surfaces(
+                [],
+                session_id,
+                stripe_decisions=[],
+                emit_final_surface=False,
+            )
+            stage.commit([
+                "transcript.txt",
+                "canonical_segments.json",
+                "provenance.json",
+                "provisional_partial.json",
+                "stabilized_partial.json",
+                "quality_gate.json",
+            ])
+            assembly_result = {"surfaces": surfaces, "segment_count": 0}
+
+        surfaces = assembly_result.get("surfaces") or {}
+        _write_live_preview_state(session_id, len(chunk_paths), audio_duration_ms, surfaces)
+        atomic_write_json(
+            str(_live_stage_root(session_id) / "live_meta.json"),
+            {
+                "session_id": session_id,
+                "chunk_count_at_run": len(chunk_paths),
+                "audio_duration_ms": audio_duration_ms,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "finalized": False,
+                "status": "done",
+            },
+        )
+
+        from app.storage.session_store import update_session_meta
+        update_session_meta(
+            session_id,
+            {
+                "last_live_chunk_count_processed": len(chunk_paths),
+                "last_live_processed_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        update_status(
+            session_id,
+            "running",
+            live_preview=True,
+            live_chunk_count=len(chunk_paths),
+            live_stabilized_until_ms=max(
+                (seg.get("end_ms", 0) for seg in (surfaces.get("stabilized_segments") or [])),
+                default=0,
+            ),
+        )
+
+        logger.info(
+            "Canonical live pipeline complete for %s: chunks=%d stabilized_segments=%d",
+            session_id,
+            len(chunk_paths),
+            len(surfaces.get("stabilized_segments") or []),
+        )
+
+    except Exception as e:
+        logger.warning("Canonical live pipeline failed for %s: %s", session_id, e)
+        atomic_write_json(
+            str(sd / "live_error.json"),
+            {
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "traceback": traceback.format_exc(),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        update_status(session_id, "running", live_preview_error=str(e), live_preview=True)
+    finally:
+        _unload_all_vram()
+        _clear_live_lock(session_id)
 
 
 def process_canonical_pipeline(job_data: dict):
@@ -313,9 +867,11 @@ def process_canonical_pipeline(job_data: dict):
         if not run.is_stage_done("first_pass_medium"):
             update_progress(session_id, "first_pass_medium", 36)
             stage = run.start_stage("first_pass_medium")
+            stage.actual_model = DEFAULT_FIRST_PASS
+            stage.routing_reason = "default_first_pass"
             try:
                 from app.pipeline.asr_executor import run_asr_execution
-                run_asr_execution(
+                summary = run_asr_execution(
                     session_id, windows, [DEFAULT_FIRST_PASS],
                     language=language,
                     allowed_languages=language_ctx["allowed_languages"],
@@ -328,12 +884,32 @@ def process_canonical_pipeline(job_data: dict):
                 atomic_write_json(str(stage.stage_dir / "first_pass_routing.json"), {
                     "selected_model": DEFAULT_FIRST_PASS,
                     "language_context": language_ctx,
+                    "asr_summary": summary,
                 })
-                stage.commit(["first_pass_routing.json"])
+                model_stats = (summary or {}).get("candidates_by_model", {}).get(DEFAULT_FIRST_PASS, {})
+                if model_stats.get("success", 0) == 0 and model_stats.get("count", 0) > 0:
+                    stage.commit_degraded(
+                        f"all {model_stats['count']} windows failed for {DEFAULT_FIRST_PASS}",
+                        ["first_pass_routing.json"],
+                    )
+                else:
+                    stage.commit(["first_pass_routing.json"])
             except Exception as e:
-                stage.commit_with_fallback([], f"first_pass_medium_error: {e}")
+                stage.commit_degraded(f"provider_crash: {e}")
 
         _unload_all_vram()
+
+        # Propagate first-pass language detection to guide subsequent models.
+        # This prevents large-v3 from mis-detecting Slavic languages (e.g. ru→pl).
+        first_pass_evidence = _first_pass_language_evidence(session_id)
+        detected_language = first_pass_evidence.get("dominant_language")
+        effective_language = language  # user-forced or requested language takes priority
+        if not effective_language and detected_language:
+            effective_language = detected_language
+            logger.info(
+                "Propagating first-pass detected language '%s' to subsequent ASR stages",
+                detected_language,
+            )
 
         # ============================================================
         # Stage 5: Candidate ASR - Large V3
@@ -341,11 +917,13 @@ def process_canonical_pipeline(job_data: dict):
         if not run.is_stage_done("candidate_asr_large_v3"):
             update_progress(session_id, "candidate_asr_large_v3", 46)
             stage = run.start_stage("candidate_asr_large_v3")
+            stage.actual_model = DEFAULT_CANDIDATE_A
+            stage.routing_reason = "default_candidate_a"
             try:
                 from app.pipeline.asr_executor import run_asr_execution
-                run_asr_execution(
+                summary = run_asr_execution(
                     session_id, windows, [DEFAULT_CANDIDATE_A],
-                    language=language,
+                    language=effective_language,
                     allowed_languages=language_ctx["allowed_languages"],
                     forced_language=language_ctx["forced_language"],
                     transcription_mode=language_ctx["transcription_mode"],
@@ -356,52 +934,109 @@ def process_canonical_pipeline(job_data: dict):
                 atomic_write_json(str(stage.stage_dir / "candidate_a_routing.json"), {
                     "selected_model": DEFAULT_CANDIDATE_A,
                     "language_context": language_ctx,
+                    "asr_summary": summary,
                 })
-                stage.commit(["candidate_a_routing.json"])
+                model_stats = (summary or {}).get("candidates_by_model", {}).get(DEFAULT_CANDIDATE_A, {})
+                if model_stats.get("success", 0) == 0 and model_stats.get("count", 0) > 0:
+                    stage.commit_degraded(
+                        f"all {model_stats['count']} windows failed for {DEFAULT_CANDIDATE_A}",
+                        ["candidate_a_routing.json"],
+                    )
+                else:
+                    stage.commit(["candidate_a_routing.json"])
             except Exception as e:
-                stage.commit_with_fallback([], f"candidate_a_error: {e}")
+                stage.commit_degraded(f"provider_crash: {e}")
 
-        _unload_all_vram()
+        # Targeted unload: destroy ctranslate2 state without clearing NeMo cache.
+        # This avoids the CUDA allocator handle conflict between ctranslate2 and PyTorch.
+        _unload_faster_whisper_only()
 
         # ============================================================
-        # Stage 6: Candidate ASR - Parakeet / Canary route
+        # Stage 6: Candidate ASR - Secondary route
         # ============================================================
-        if not run.is_stage_done("candidate_asr_parakeet"):
-            update_progress(session_id, "candidate_asr_parakeet", 58)
-            stage = run.start_stage("candidate_asr_parakeet")
+        if not run.is_stage_done("candidate_asr_secondary"):
+            update_progress(session_id, "candidate_asr_secondary", 58)
+            stage = run.start_stage("candidate_asr_secondary")
             try:
                 from app.pipeline.asr_executor import run_asr_execution
-                candidate_b_model, candidate_b_reason = _select_candidate_b_model(language_ctx)
+                first_pass_evidence = _first_pass_language_evidence(session_id)
+                candidate_b_model, candidate_b_reason = _select_candidate_b_model(language_ctx, session_id=session_id)
+                candidate_b_language_ctx = _candidate_b_execution_language_ctx(
+                    candidate_b_model,
+                    candidate_b_reason,
+                    language_ctx,
+                )
+                stage.actual_model = candidate_b_model
+                stage.routing_reason = candidate_b_reason
                 if candidate_b_model:
-                    run_asr_execution(
+                    summary = run_asr_execution(
                         session_id,
                         windows,
                         [candidate_b_model],
-                        language=language,
-                        allowed_languages=language_ctx["allowed_languages"],
-                        forced_language=language_ctx["forced_language"],
-                        transcription_mode=language_ctx["transcription_mode"],
+                        language=candidate_b_language_ctx["language"],
+                        allowed_languages=candidate_b_language_ctx["allowed_languages"],
+                        forced_language=candidate_b_language_ctx["forced_language"],
+                        transcription_mode=candidate_b_language_ctx["transcription_mode"],
                         progress_callback=lambda p: update_progress(
-                            session_id, "candidate_asr_parakeet", 58 + int(p * 0.1)
+                            session_id, "candidate_asr_secondary", 58 + int(p * 0.1)
                         ),
                     )
                     atomic_write_json(str(stage.stage_dir / "candidate_b_routing.json"), {
                         "selected_model": candidate_b_model,
                         "reason": candidate_b_reason,
                         "language_context": language_ctx,
+                        "effective_language_context": candidate_b_language_ctx,
+                        "first_pass_language_evidence": first_pass_evidence,
+                        "asr_summary": summary,
                     })
-                    stage.commit(["candidate_b_routing.json"])
+                    model_stats = (summary or {}).get("candidates_by_model", {}).get(candidate_b_model, {})
+                    if model_stats.get("success", 0) == 0 and model_stats.get("count", 0) > 0:
+                        stage.commit_degraded(
+                            f"all {model_stats['count']} windows failed for {candidate_b_model}",
+                            ["candidate_b_routing.json"],
+                        )
+                    else:
+                        stage.commit(["candidate_b_routing.json"])
                 else:
                     atomic_write_json(str(stage.stage_dir / "candidate_b_routing.json"), {
                         "selected_model": None,
                         "reason": candidate_b_reason,
                         "language_context": language_ctx,
+                        "effective_language_context": candidate_b_language_ctx,
+                        "first_pass_language_evidence": first_pass_evidence,
                     })
                     stage.commit_with_fallback(["candidate_b_routing.json"], candidate_b_reason)
             except Exception as e:
-                stage.commit_with_fallback([], f"candidate_b_parakeet_error: {e}")
+                stage.actual_model = stage.actual_model or "unknown"
+                stage.commit_degraded(f"provider_crash: {e}")
 
         _unload_all_vram()
+
+        # ============================================================
+        # Post-ASR validation: fail early if zero candidates succeeded
+        # ============================================================
+        cand_dir = sd / "candidates"
+        successful_candidates = 0
+        total_candidates = 0
+        if cand_dir.is_dir():
+            for f in cand_dir.glob("cand_*.json"):
+                c = safe_read_json(str(f))
+                if c:
+                    total_candidates += 1
+                    if c.get("confidence_features", {}).get("success"):
+                        successful_candidates += 1
+        if successful_candidates == 0:
+            asr_stages = ["first_pass_medium", "candidate_asr_large_v3", "candidate_asr_secondary"]
+            stage_errors = []
+            for sn in asr_stages:
+                s = run.get_stage(sn)
+                if s.error:
+                    stage_errors.append(f"{sn}: {s.error}")
+            error_detail = "; ".join(stage_errors) if stage_errors else "unknown"
+            raise RuntimeError(
+                f"All ASR models failed — zero successful candidates out of "
+                f"{total_candidates} attempted. Stage errors: {error_detail}"
+            )
 
         # ============================================================
         # Stage 7: Stripe Grouping
@@ -500,7 +1135,42 @@ def process_canonical_pipeline(job_data: dict):
         _unload_all_vram()
 
         # ============================================================
-        # Stage 11: Derived Outputs
+        # Stage 11: Semantic Marking
+        # ============================================================
+        if not run.is_stage_done("semantic_marking"):
+            update_progress(session_id, "semantic_marking", 95)
+            stage = run.start_stage("semantic_marking")
+            try:
+                from app.pipeline.semantic_marking import run_semantic_marking
+                # run_semantic_marking now also emits enrichment/context_spans.json
+                # (Phase 2 -- continuity-based grouping of canonical segments).
+                marking_result = run_semantic_marking(session_id, segments, stage)
+                logger.info(
+                    "semantic_marking done for %s: markers=%s, semantic_spans=%s, context_spans=%s",
+                    session_id,
+                    marking_result.get("marker_count", 0),
+                    marking_result.get("semantic_span_count", 0),
+                    marking_result.get("context_span_count", 0),
+                )
+            except Exception as e:
+                stage.commit_with_fallback([], f"semantic_marking_error: {e}")
+
+        # ============================================================
+        # Stage 12: Memory Graph Update
+        # ============================================================
+        if not run.is_stage_done("memory_graph_update"):
+            update_progress(session_id, "memory_graph_update", 97)
+            stage = run.start_stage("memory_graph_update")
+            try:
+                from app.pipeline.memory_graph import run_memory_graph_update
+                marker_payload = safe_read_json(str(sd / "enrichment" / "segment_markers.json")) or {}
+                markers = marker_payload.get("markers") or []
+                run_memory_graph_update(session_id, markers, stage)
+            except Exception as e:
+                stage.commit_with_fallback([], f"memory_graph_error: {e}")
+
+        # ============================================================
+        # Stage 13: Derived Outputs
         # ============================================================
         if not run.is_stage_done("derived_outputs"):
             update_progress(session_id, "derived_outputs", 96)
@@ -510,6 +1180,41 @@ def process_canonical_pipeline(job_data: dict):
                 run_derived_outputs(session_id, segments, text, audio_duration_ms, stage)
             except Exception as e:
                 stage.commit_with_fallback([], f"derived_error: {e}")
+
+        # ============================================================
+        # Stage 14: NoSQL Projection
+        # ============================================================
+        if not run.is_stage_done("nosql_projection"):
+            update_progress(session_id, "nosql_projection", 98)
+            stage = run.start_stage("nosql_projection")
+            try:
+                from app.pipeline.nosql_projection import run_nosql_projection
+                nosql_result = run_nosql_projection(session_id, stage)
+                logger.info(
+                    "nosql_projection done for %s: %d docs",
+                    session_id,
+                    nosql_result.get("total_doc_count", 0),
+                )
+            except Exception as e:
+                stage.commit_with_fallback([], f"nosql_projection_error: {e}")
+
+        # ============================================================
+        # Stage 15: Thread Linking (cross-session)
+        # ============================================================
+        if not run.is_stage_done("thread_linking"):
+            update_progress(session_id, "thread_linking", 99)
+            stage = run.start_stage("thread_linking")
+            try:
+                from app.pipeline.thread_linking import run_thread_linking
+                thread_result = run_thread_linking(session_id, stage)
+                logger.info(
+                    "thread_linking done for %s: %d candidates, %d threads",
+                    session_id,
+                    thread_result.get("candidate_count", 0),
+                    thread_result.get("thread_count", 0),
+                )
+            except Exception as e:
+                stage.commit_with_fallback([], f"thread_linking_error: {e}")
 
         # ============================================================
         # Pipeline Complete
@@ -755,11 +1460,31 @@ def main():
 
     # GPU probe
     gpu_info = _get_gpu_diagnostics()
-    logger.info(f"GPU: {gpu_info}")
+    logger.info("=" * 40)
+    logger.info("GPU DIAGNOSTICS")
+    logger.info(f"  GPU available:      {gpu_info.get('gpu_available')}")
+    logger.info(f"  GPU name:           {gpu_info.get('gpu_name')}")
+    logger.info(f"  GPU reason:         {gpu_info.get('gpu_reason')}")
+    logger.info(f"  CUDA version:       {gpu_info.get('cuda_version', 'N/A')}")
+    logger.info(f"  VRAM total:         {gpu_info.get('memory_total_mb', 'N/A')} MB")
+    logger.info(f"  Effective device:   {gpu_info.get('effective_device')}")
+    logger.info(f"  Effective compute:  {gpu_info.get('effective_compute_type')}")
+    logger.info(f"  Selection method:   {gpu_info.get('device_selection_method')}")
+    bs = gpu_info.get("backend_status", {})
+    logger.info(f"  torch CUDA:         {bs.get('torch_cuda_available')} (devices={bs.get('torch_cuda_device_count', 0)})")
+    logger.info(f"  ctranslate2 CUDA:   devices={bs.get('ctranslate2_cuda_device_count', 0)}")
+    logger.info(f"  faster-whisper:     {'OK' if bs.get('faster_whisper_importable') else bs.get('faster_whisper_error', 'not checked')}")
+    logger.info(f"  NeMo ASR:           {'OK' if bs.get('nemo_importable') else bs.get('nemo_error', 'not checked')}")
+    conf = gpu_info.get("config", {})
+    logger.info(f"  Config device:      {conf.get('whisper_device')}")
+    logger.info(f"  Config compute:     {conf.get('whisper_compute_type')}")
+    logger.info(f"  Config fallbacks:   {conf.get('whisper_compute_type_fallbacks')}")
+    logger.info(f"  Strict CUDA:        {conf.get('strict_cuda')}")
+    logger.info("=" * 40)
     _write_worker_health(gpu_info)
 
     if cfg.worker.strict_cuda and not gpu_info.get("gpu_available"):
-        logger.error("STRICT_CUDA=true but no GPU available. Exiting.")
+        logger.error("WHISPER_STRICT_CUDA=true but no GPU available. Exiting.")
         sys.exit(1)
 
     # Redis connect with retry
@@ -808,6 +1533,8 @@ def main():
             # Dispatch
             if job_type == "v2_canonical":
                 process_canonical_pipeline(job_data)
+            elif job_type == "v2_canonical_live":
+                process_canonical_live_job(job_data)
             elif job_type == "v2_partial":
                 process_partial_job(job_data)
             elif job_type == "v2_retranscribe":

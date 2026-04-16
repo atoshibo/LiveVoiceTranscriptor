@@ -1,5 +1,5 @@
 """
-Stage 9 - Selective Enrichment
+Stage 10 - Selective Enrichment
 
 Enrichment is downstream of canonical lexical truth. It must never become
 the hidden source of transcript words.
@@ -18,7 +18,7 @@ Output: canonical/ segments updated with speaker labels (when justified)
 """
 import logging
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from app.core.config import get_config
 from app.core.atomic_io import atomic_write_json, safe_read_json
@@ -27,44 +27,72 @@ from app.storage.session_store import session_dir, get_session_meta
 logger = logging.getLogger(__name__)
 
 
-def should_run_diarization(session_meta: dict, segments: List[Dict],
-                           policy: str = "auto") -> bool:
-    """Determine if diarization should run.
+def _diarization_decision(session_meta: dict, policy: str) -> Tuple[bool, str]:
+    """Return (requested, reason).
 
-    Policy options:
-      - "off": never run
-      - "forced": always run
-      - "auto": run if evidence suggests multiple speakers
+    The reason string is persisted in diarization_status.json so audit can
+    see *why* we ran (or skipped) without re-running the heuristic.
     """
     if policy == "off":
-        return False
+        return False, "policy_off"
     if policy == "forced":
-        return True
+        return True, "policy_forced"
 
-    # Auto: check hints
     if session_meta.get("run_diarization"):
-        return True
+        return True, "caller_hint_run_diarization"
     if session_meta.get("diarization_hint"):
-        return True
+        return True, "caller_hint_diarization_hint"
 
     speaker_count = session_meta.get("speaker_count", 1)
     if speaker_count and speaker_count > 1:
-        return True
+        return True, f"speaker_count_declared:{speaker_count}"
 
-    return False
+    duration_ms = session_meta.get("duration_ms") or session_meta.get("audio_duration_ms") or 0
+    if duration_ms and duration_ms >= 45000:
+        return True, f"auto_duration_ms:{int(duration_ms)}"
+
+    filename_hint = " ".join(
+        str(session_meta.get(key) or "").lower()
+        for key in ("original_filename", "filename", "source_filename", "title")
+    )
+    for token in (
+        "2voices", "3voix", "3voices", "voices", "voix",
+        "interview", "phonecall", "phone_call", "call",
+        "meeting", "conversation", "dialogue", "discussion",
+        "panel", "podcast",
+    ):
+        if token in filename_hint:
+            return True, f"auto_filename_hint:{token}"
+
+    return False, "auto_short_monologue"
 
 
-def run_diarization(audio_path: str, session_meta: dict) -> Optional[List[Dict]]:
+def should_run_diarization(session_meta: dict, segments: List[Dict],
+                           policy: str = "auto") -> bool:
+    """Determine if diarization should run.  See `_diarization_decision` for
+    the reason-returning sibling used by the status-persistence path."""
+    requested, _reason = _diarization_decision(session_meta, policy)
+    return requested
+
+
+def run_diarization(audio_path: str, session_meta: dict) -> Tuple[Optional[List[Dict]], str]:
     """Run speaker diarization on the audio.
 
-    Returns list of speaker turns: [{speaker, start_s, end_s}]
+    Returns (turns, status). `status` is one of:
+      - "done": turns were produced
+      - "no_model_path": cfg.model_paths.diarization_path is unset
+      - "package_missing": pyannote.audio isn't installed
+      - "failed:<err>": pyannote loaded but raised an exception
+    Callers are expected to persist this status so "diarization was requested
+    but unavailable" is visible to audit tools instead of silently becoming
+    'skipped'.
     """
     cfg = get_config()
     model_path = cfg.model_paths.diarization_path
 
     if not model_path:
         logger.info("No diarization model path configured")
-        return None
+        return None, "no_model_path"
 
     try:
         from pyannote.audio import Pipeline as PyannotePipeline
@@ -96,15 +124,15 @@ def run_diarization(audio_path: str, session_meta: dict) -> Optional[List[Dict]]
                 "end_s": round(turn.end, 3),
             })
 
-        return turns
+        return turns, "done"
 
     except ImportError:
         logger.warning("pyannote.audio not available, skipping diarization")
-        return None
+        return None, "package_missing"
     except Exception as e:
         logger.error(f"Diarization failed: {e}")
         if cfg.diarization.fallback_on_error:
-            return None
+            return None, f"failed:{type(e).__name__}"
         raise
 
 
@@ -168,23 +196,40 @@ def run_selective_enrichment(session_id: str, segments: List[Dict],
 
     speaker_turns = None
     diarization_status = "skipped"
+    diarization_requested, diarization_reason = _diarization_decision(meta, diarization_policy)
 
-    if should_run_diarization(meta, segments, diarization_policy):
-        logger.info(f"Running selective diarization for {session_id}")
-        speaker_turns = run_diarization(audio_path, meta)
+    if diarization_requested:
+        logger.info(f"Running selective diarization for {session_id}: {diarization_reason}")
+        speaker_turns, diarization_status = run_diarization(audio_path, meta)
         if speaker_turns:
-            diarization_status = "done"
-            # Persist speaker turns
             atomic_write_json(str(sd / "canonical" / "speaker_turns.json"), {
                 "session_id": session_id,
                 "turns": speaker_turns,
                 "turn_count": len(speaker_turns),
                 "speakers": sorted(set(t["speaker"] for t in speaker_turns)),
             })
-        else:
-            diarization_status = "failed"
     else:
-        logger.info(f"Diarization not justified for {session_id}")
+        logger.info(f"Diarization not justified for {session_id}: {diarization_reason}")
+
+    # "available" captures whether the model could run at all for this
+    # request.  It is distinct from "status" -- a skipped auto run is
+    # available but not requested; a package_missing run is unavailable.
+    available = True
+    if diarization_status in {"no_model_path", "package_missing"} or diarization_status.startswith("failed:"):
+        available = False
+
+    # Always persist an explicit diarization status so "requested but
+    # unavailable" is visible in audit, not silently hidden behind 'skipped'.
+    diarization_payload = {
+        "session_id": session_id,
+        "policy": diarization_policy,
+        "requested": diarization_requested,
+        "reason": diarization_reason,
+        "available": available,
+        "status": diarization_status,
+        "turn_count": len(speaker_turns) if speaker_turns else 0,
+    }
+    atomic_write_json(str(sd / "canonical" / "diarization_status.json"), diarization_payload)
 
     # Only attach speakers when selective diarization produced real evidence.
     if speaker_turns:
@@ -209,6 +254,9 @@ def run_selective_enrichment(session_id: str, segments: List[Dict],
     result = {
         "diarization_policy": diarization_policy,
         "diarization_status": diarization_status,
+        "diarization_requested": diarization_requested,
+        "diarization_reason": diarization_reason,
+        "diarization_available": available,
         "speaker_count": len({s.get("speaker") for s in segments if s.get("speaker")}),
         "turn_count": len(speaker_turns) if speaker_turns else 0,
     }
@@ -220,6 +268,7 @@ def run_selective_enrichment(session_id: str, segments: List[Dict],
         "provisional_partial.json",
         "stabilized_partial.json",
         "final_transcript.json",
+        "diarization_status.json",
     ]
     if speaker_turns:
         artifacts.append("speaker_turns.json")

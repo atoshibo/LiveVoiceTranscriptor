@@ -14,7 +14,6 @@ Output: candidates/ with per-model per-window candidate files
 """
 import gc
 import os
-import uuid
 import logging
 import time
 import wave
@@ -27,12 +26,14 @@ from app.models.registry import (
     get_model_info, resolve_model_id, is_model_safe_for_language,
     DEFAULT_FIRST_PASS, DEFAULT_CANDIDATE_A, DEFAULT_CANDIDATE_B,
 )
+from app.pipeline.witness_diagnostics import compute_candidate_flags
 from app.storage.session_store import session_dir
 
 logger = logging.getLogger(__name__)
 
 # Model caches for sequential VRAM management
 _faster_whisper_model = None
+_faster_whisper_runtime_preferences: Dict[str, tuple[str, str]] = {}
 _nemo_model_cache: Dict[str, object] = {}
 _hf_model_cache: Dict[str, tuple] = {}
 
@@ -117,66 +118,160 @@ def _fallback_result(
     }
 
 
-def unload_all_models():
-    """Free all cached models and VRAM."""
+def unload_faster_whisper():
+    """Unload faster-whisper / ctranslate2 and aggressively reclaim CUDA state.
+
+    ctranslate2 uses its own CUDA allocator which corrupts PyTorch's handle
+    tracking.  We must fully destroy all ctranslate2 objects, force GC, then
+    reset PyTorch's CUDA state before any PyTorch-based model (NeMo) can use
+    the GPU.
+    """
     global _faster_whisper_model
+    if _faster_whisper_model is not None:
+        logger.info("Unloading faster-whisper model and reclaiming CUDA state")
     _faster_whisper_model = None
+    _faster_whisper_runtime_preferences.clear()
+    # Double GC to ensure ctranslate2 C++ destructors run before PyTorch reclaims
+    gc.collect()
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            # Reset memory stats so the allocator starts fresh
+            torch.cuda.reset_peak_memory_stats()
+    except (ImportError, RuntimeError):
+        pass
+
+
+def unload_nemo_models():
+    """Unload NeMo models and free VRAM."""
+    if _nemo_model_cache:
+        logger.info("Unloading %d NeMo model(s)", len(_nemo_model_cache))
     _nemo_model_cache.clear()
-    _hf_model_cache.clear()
     gc.collect()
     try:
         import torch
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    except ImportError:
+    except (ImportError, RuntimeError):
         pass
+
+
+def unload_all_models():
+    """Free all cached models and VRAM."""
+    unload_faster_whisper()
+    unload_nemo_models()
+    _hf_model_cache.clear()
+    gc.collect()
+
+
+def _resolve_gpu_runtime(cfg) -> dict:
+    """Determine device + compute_type using explicit config, then hardware probes.
+
+    Returns dict with: device, compute_type, method (how the decision was made),
+    and diagnostic details for audit logging.
+    """
+    requested_device = cfg.worker.whisper_device  # "cuda" or "cpu"
+    requested_compute = cfg.worker.whisper_compute_type  # "float16", "int8", etc.
+    fallbacks = cfg.worker.whisper_compute_type_fallbacks  # ["int8_float16", "int8"]
+    strict = cfg.worker.strict_cuda
+
+    diag = {
+        "requested_device": requested_device,
+        "requested_compute_type": requested_compute,
+        "strict_cuda": strict,
+        "torch_cuda": False,
+        "ctranslate2_cuda_devices": 0,
+    }
+
+    # Probe hardware
+    try:
+        import torch
+        diag["torch_cuda"] = torch.cuda.is_available()
+        if diag["torch_cuda"]:
+            diag["gpu_name"] = torch.cuda.get_device_name(cfg.worker.cuda_device_index)
+    except Exception:
+        pass
+
+    try:
+        import ctranslate2
+        diag["ctranslate2_cuda_devices"] = int(ctranslate2.get_cuda_device_count())
+    except Exception:
+        pass
+
+    cuda_available = diag["torch_cuda"] or diag["ctranslate2_cuda_devices"] > 0
+
+    if requested_device == "cuda":
+        if cuda_available:
+            diag["method"] = "config_cuda_confirmed"
+            return {"device": "cuda", "compute_type": requested_compute, **diag}
+
+        # CUDA requested but not available
+        if strict:
+            diag["method"] = "strict_cuda_failed"
+            return {"device": "FAIL", "compute_type": requested_compute, **diag}
+
+        logger.warning("WHISPER_DEVICE=cuda but no CUDA available — falling back to CPU")
+        diag["method"] = "cuda_requested_but_unavailable_cpu_fallback"
+        return {"device": "cpu", "compute_type": "int8", **diag}
+
+    # CPU explicitly requested
+    diag["method"] = "config_cpu_explicit"
+    return {"device": "cpu", "compute_type": "int8", **diag}
 
 
 def _transcribe_faster_whisper(audio_path: str, model_size: str,
                                 language: str = None) -> Dict:
-    """Transcribe using faster-whisper."""
+    """Transcribe using faster-whisper with explicit GPU strategy from config."""
     global _faster_whisper_model
-    try:
+    cfg = get_config()
+
+    # Check for a sticky override (set after a CUDA failure with strict=false)
+    override = _faster_whisper_runtime_preferences.get(model_size)
+    if override:
+        device, compute_type = override
+        runtime_info = {"device": device, "compute_type": compute_type, "method": "sticky_override"}
+    else:
+        runtime_info = _resolve_gpu_runtime(cfg)
+        device = runtime_info["device"]
+        compute_type = runtime_info["compute_type"]
+
+    if device == "FAIL":
+        msg = (
+            f"WHISPER_STRICT_CUDA=true but no CUDA runtime available. "
+            f"torch_cuda={runtime_info.get('torch_cuda')}, "
+            f"ctranslate2_cuda={runtime_info.get('ctranslate2_cuda_devices')}"
+        )
+        logger.error(msg)
+        return _fallback_result(f"faster-whisper:{model_size}", msg, language)
+
+    def _load_and_transcribe(dev: str, ct: str) -> Dict:
+        global _faster_whisper_model
         from faster_whisper import WhisperModel
 
-        # faster-whisper runs on CTranslate2, so probe that backend first.
-        device = "cpu"
-        compute_type = "int8"
-        try:
-            import ctranslate2
-
-            if int(ctranslate2.get_cuda_device_count()) > 0:
-                device = "cuda"
-                compute_type = "float16"
-        except Exception:
-            pass
-
-        if device == "cpu":
-            try:
-                import torch
-                if torch.cuda.is_available():
-                    device = "cuda"
-                    compute_type = "float16"
-            except ImportError:
-                pass
-            except Exception:
-                pass
-
-        try:
-            if device == "cuda":
-                logger.info("Loading faster-whisper:%s on GPU", model_size)
-        except Exception:
-            pass
-
-        if _faster_whisper_model is None or getattr(_faster_whisper_model, '_model_size', '') != model_size:
+        needs_reload = (
+            _faster_whisper_model is None
+            or getattr(_faster_whisper_model, "_model_size", "") != model_size
+            or getattr(_faster_whisper_model, "_device", "") != dev
+        )
+        if needs_reload:
             unload_all_models()
+            logger.info(
+                "Loading faster-whisper:%s on %s (compute_type=%s)",
+                model_size, dev.upper(), ct,
+            )
             _faster_whisper_model = WhisperModel(
-                model_size, device=device, compute_type=compute_type
+                model_size, device=dev, compute_type=ct,
+                device_index=cfg.worker.cuda_device_index if dev == "cuda" else 0,
             )
             _faster_whisper_model._model_size = model_size
+            _faster_whisper_model._device = dev
 
         kwargs = {"language": language} if language and language != "auto" else {}
-        kwargs["task"] = "transcribe"  # NEVER translate
+        kwargs["task"] = "transcribe"
         kwargs["beam_size"] = 5
 
         segments_iter, info = _faster_whisper_model.transcribe(audio_path, **kwargs)
@@ -191,23 +286,208 @@ def _transcribe_faster_whisper(audio_path: str, model_size: str,
             })
             full_text_parts.append(seg.text.strip())
 
-        return {
+        result = {
             "text": " ".join(full_text_parts),
             "segments": segments,
             "detection_info": {
                 "detected_language": info.language,
                 "language_probability": info.language_probability,
                 "requested_language": language,
+                "device": dev,
+                "compute_type": ct,
             },
             "success": True,
             "segment_timestamp_unit": "seconds",
         }
+        return result
+
+    try:
+        return _load_and_transcribe(device, compute_type)
     except ImportError as e:
         logger.warning("faster-whisper not installed; using degraded fallback")
         return _fallback_result(f"faster-whisper:{model_size}", f"provider_unavailable:{e}", language)
     except Exception as e:
-        logger.error(f"faster-whisper transcription failed: {e}")
+        error_text = str(e).lower()
+        is_cuda_error = any(tok in error_text for tok in ("cuda", "cublas", "cudnn", "ctranslate"))
+
+        if device == "cuda" and is_cuda_error:
+            # Try compute_type fallbacks before giving up on GPU
+            for fb_ct in cfg.worker.whisper_compute_type_fallbacks:
+                logger.warning(
+                    "faster-whisper:%s CUDA failed with %s (%s); trying compute_type=%s",
+                    model_size, compute_type, e, fb_ct,
+                )
+                try:
+                    unload_all_models()
+                    return _load_and_transcribe("cuda", fb_ct)
+                except Exception:
+                    continue
+
+            # All GPU attempts exhausted — CPU fallback if not strict
+            if not cfg.worker.strict_cuda:
+                logger.warning(
+                    "faster-whisper:%s all CUDA compute types failed; falling back to CPU (WHISPER_STRICT_CUDA=false)",
+                    model_size,
+                )
+                try:
+                    _faster_whisper_runtime_preferences[model_size] = ("cpu", "int8")
+                    unload_all_models()
+                    return _load_and_transcribe("cpu", "int8")
+                except Exception as retry_error:
+                    logger.error("faster-whisper CPU retry also failed: %s", retry_error)
+                    return _fallback_result(f"faster-whisper:{model_size}", str(retry_error), language)
+            else:
+                logger.error(
+                    "faster-whisper:%s CUDA failed and WHISPER_STRICT_CUDA=true — not falling back to CPU",
+                    model_size,
+                )
+
+        logger.error("faster-whisper:%s transcription failed: %s", model_size, e)
         return _fallback_result(f"faster-whisper:{model_size}", str(e), language)
+
+
+def _cuda_vram_free_mb() -> float:
+    """Return free GPU memory in MB, or 0 if unavailable."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free, _ = torch.cuda.mem_get_info()
+            return free / (1024 * 1024)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _load_nemo_model(model_path: str, model_id: str, device: str = "cuda"):
+    """Load (or retrieve cached) NeMo model, handling CUDA fallback to CPU.
+
+    Strategy:
+    1. Always restore_from with map_location='cpu' to avoid CUDA issues
+       during deserialization (ctranslate2 corrupts PyTorch handle tracker).
+    2. Only move to CUDA if enough free VRAM (model_size * 1.3 headroom).
+    3. On CUDA OOM during .cuda(), keep the CPU model — never reload from disk.
+    """
+    import nemo.collections.asr as nemo_asr
+
+    # Check cache — try requested device first, then fall back to any device
+    cache_key = f"{model_path}:{device}"
+    if cache_key in _nemo_model_cache:
+        return _nemo_model_cache[cache_key], device
+    # If we requested CUDA but have a CPU-cached version, use it
+    if device == "cuda":
+        cpu_key = f"{model_path}:cpu"
+        if cpu_key in _nemo_model_cache:
+            logger.info("Using cached CPU model for %s (skipping CUDA)", model_id)
+            return _nemo_model_cache[cpu_key], "cpu"
+
+    # Find .nemo file
+    nemo_file = None
+    for f in Path(model_path).iterdir():
+        if f.suffix == ".nemo" and f.stat().st_size > 1_000_000:
+            nemo_file = str(f)
+            break
+    if nemo_file is None:
+        raise FileNotFoundError(f"no .nemo file found in {model_path}")
+
+    # Always load on CPU first to avoid ctranslate2↔PyTorch CUDA handle conflict.
+    # NeMo's restore_from internally instantiates sub-models which may try to use
+    # CUDA. map_location='cpu' prevents this.
+    logger.info("Loading NeMo model %s from %s (map_location=cpu)", model_id, nemo_file)
+    try:
+        model = nemo_asr.models.ASRModel.restore_from(
+            nemo_file, map_location="cpu"
+        )
+    except Exception as e:
+        logger.error("NeMo restore_from failed for %s: %s", model_id, e)
+        raise
+
+    # Optionally move to CUDA if requested and enough VRAM available
+    actual_device = "cpu"
+    if device == "cuda":
+        import torch
+        if torch.cuda.is_available():
+            # Estimate model size from parameter count
+            param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+            param_mb = param_bytes / (1024 * 1024)
+            free_mb = _cuda_vram_free_mb()
+            headroom = param_mb * 1.3  # 30% overhead for activations/buffers
+
+            if free_mb > headroom:
+                try:
+                    logger.info(
+                        "Moving NeMo %s to CUDA (params=%.0fMB, free=%.0fMB)",
+                        model_id, param_mb, free_mb,
+                    )
+                    model = model.cuda()
+                    actual_device = "cuda"
+                except RuntimeError as cuda_err:
+                    logger.warning(
+                        "NeMo %s .cuda() failed (%s); keeping on CPU",
+                        model_id, cuda_err,
+                    )
+                    # Model stays on CPU — do NOT reload from disk
+                    model = model.cpu()
+                    gc.collect()
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+            else:
+                logger.info(
+                    "Skipping CUDA for NeMo %s: params=%.0fMB needs ~%.0fMB but only %.0fMB free",
+                    model_id, param_mb, headroom, free_mb,
+                )
+
+    final_key = f"{model_path}:{actual_device}"
+    _nemo_model_cache[final_key] = model
+    return model, actual_device
+
+
+def _run_nemo_inference(model, tmp_path: str, model_id: str,
+                        language: str, is_canary: bool) -> tuple:
+    """Run NeMo transcription and extract text + segments."""
+    if is_canary:
+        lang = language if language and language != "auto" else "en"
+        try:
+            result = model.transcribe(
+                [tmp_path],
+                source_lang=lang,
+                target_lang=lang,
+                pnc="yes",
+            )
+        except TypeError:
+            result = model.transcribe(
+                [tmp_path],
+                source_lang=lang,
+                target_lang=lang,
+            )
+    else:
+        result = model.transcribe([tmp_path], timestamps=True)
+
+    # Extract text and segments
+    if hasattr(result, '__iter__') and not isinstance(result, str):
+        if hasattr(result[0], 'text'):
+            text = result[0].text
+            segments = []
+            if hasattr(result[0], 'timestamp') and result[0].timestamp:
+                ts = result[0].timestamp
+                if isinstance(ts, dict) and "word" in ts:
+                    for w in ts["word"]:
+                        segments.append({
+                            "start": w.get("start", 0.0),
+                            "end": w.get("end", 0.0),
+                            "text": w.get("word", ""),
+                        })
+            if not segments and text:
+                segments = [{"start": 0.0, "end": 30.0, "text": text}]
+        else:
+            text = str(result[0]) if result else ""
+            segments = [{"start": 0.0, "end": 30.0, "text": text}] if text else []
+    else:
+        text = str(result) if result else ""
+        segments = [{"start": 0.0, "end": 30.0, "text": text}] if text else []
+
+    return text, segments
 
 
 def _transcribe_nemo(audio_path: str, model_path: str,
@@ -219,7 +499,6 @@ def _transcribe_nemo(audio_path: str, model_path: str,
     low confidence and provenance degradation.
     """
     try:
-        import nemo.collections.asr as nemo_asr
         from app.pipeline.ingest import normalize_audio_file
         import tempfile
 
@@ -230,67 +509,42 @@ def _transcribe_nemo(audio_path: str, model_path: str,
         try:
             normalize_audio_file(audio_path, tmp_path)
 
-            if model_path not in _nemo_model_cache:
-                # Find .nemo file
-                nemo_file = None
-                for f in Path(model_path).iterdir():
-                    if f.suffix == ".nemo" and f.stat().st_size > 1_000_000:
-                        nemo_file = str(f)
-                        break
-                if nemo_file is None:
-                    return _fallback_result(model_id, "no_nemo_file_found", language)
+            # Determine preferred device
+            cfg = get_config()
+            preferred_device = cfg.worker.whisper_device  # same GPU preference
 
-                model = nemo_asr.models.ASRModel.restore_from(nemo_file)
-                _nemo_model_cache[model_path] = model
+            model, actual_device = _load_nemo_model(model_path, model_id, preferred_device)
+            is_canary = "canary" in model_id.lower() or "MultiTask" in type(model).__name__
 
-            model = _nemo_model_cache[model_path]
-
-            # Determine model type
-            is_canary = "MultiTask" in type(model).__name__
-
-            if is_canary:
-                # Canary: transcribe only (source_lang == target_lang)
-                lang = language if language and language != "auto" else "en"
-                try:
-                    result = model.transcribe(
-                        [tmp_path],
-                        source_lang=lang,
-                        target_lang=lang,
-                        pnc="yes",
+            try:
+                text, segments = _run_nemo_inference(model, tmp_path, model_id, language, is_canary)
+            except RuntimeError as e:
+                error_text = str(e).lower()
+                if "cuda" in error_text or "assert" in error_text or "allocat" in error_text:
+                    logger.warning(
+                        "NeMo %s inference CUDA error (%s); moving model to CPU and retrying",
+                        model_id, e,
                     )
-                except TypeError:
-                    result = model.transcribe(
-                        [tmp_path],
-                        source_lang=lang,
-                        target_lang=lang,
-                    )
-            else:
-                # Parakeet TDT / other RNNT/CTC
-                result = model.transcribe([tmp_path], timestamps=True)
-
-            # Extract text and segments
-            if hasattr(result, '__iter__') and not isinstance(result, str):
-                if hasattr(result[0], 'text'):
-                    text = result[0].text
-                    segments = []
-                    # Try to get word timestamps
-                    if hasattr(result[0], 'timestamp') and result[0].timestamp:
-                        ts = result[0].timestamp
-                        if isinstance(ts, dict) and "word" in ts:
-                            for w in ts["word"]:
-                                segments.append({
-                                    "start": w.get("start", 0.0),
-                                    "end": w.get("end", 0.0),
-                                    "text": w.get("word", ""),
-                                })
-                    if not segments and text:
-                        segments = [{"start": 0.0, "end": 30.0, "text": text}]
+                    # Move existing model to CPU instead of reloading from disk
+                    cache_key = f"{model_path}:{actual_device}"
+                    _nemo_model_cache.pop(cache_key, None)
+                    try:
+                        model = model.cpu()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    try:
+                        import torch
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    cpu_key = f"{model_path}:cpu"
+                    _nemo_model_cache[cpu_key] = model
+                    actual_device = "cpu"
+                    text, segments = _run_nemo_inference(model, tmp_path, model_id, language, is_canary)
                 else:
-                    text = str(result[0]) if result else ""
-                    segments = [{"start": 0.0, "end": 30.0, "text": text}] if text else []
-            else:
-                text = str(result) if result else ""
-                segments = [{"start": 0.0, "end": 30.0, "text": text}] if text else []
+                    raise
 
             # Honest language handling for Parakeet
             language_note = None
@@ -361,7 +615,24 @@ def persist_candidate(session_id: str, window: Dict, model_id: str,
                       result: Dict) -> Dict:
     """Persist a single ASR candidate to candidates/."""
     sd = session_dir(session_id)
-    candidate_id = f"cand_{uuid.uuid4().hex[:8]}"
+    model_key = str(model_id).replace(":", "_").replace("/", "_")
+    candidate_id = f"cand_{window['window_id']}_{model_key}"
+
+    detection_info = result.get("detection_info", {}) or {}
+    requested_language = result.get("requested_language") or detection_info.get("requested_language")
+    transcription_mode = result.get("transcription_mode")
+    duration_s = max(0.0, (window["end_ms"] - window["start_ms"]) / 1000.0)
+
+    witness = compute_candidate_flags(
+        raw_text=result.get("text", ""),
+        detected_language=detection_info.get("detected_language"),
+        requested_language=requested_language,
+        transcription_mode=transcription_mode,
+        success=result.get("success", False),
+        degraded=result.get("degraded", False),
+        duration_s=duration_s,
+        segments=result.get("segments", []),
+    )
 
     candidate = {
         "candidate_id": candidate_id,
@@ -373,20 +644,23 @@ def persist_candidate(session_id: str, window: Dict, model_id: str,
         "window_type": window["window_type"],
         "raw_text": result.get("text", ""),
         "segments": result.get("segments", []),
-        "language_evidence": result.get("detection_info", {}),
+        "language_evidence": detection_info,
         "confidence_features": {
             "success": result.get("success", False),
             "error": result.get("error"),
             "degraded": result.get("degraded", False),
         },
+        "candidate_flags": witness["candidate_flags"],
+        "witness_audit": witness["diagnostics"],
         "decode_metadata": {
             "model_id": model_id,
-            "transcription_mode": result.get("transcription_mode"),
+            "requested_language": requested_language,
+            "transcription_mode": transcription_mode,
             "segment_timestamp_unit": result.get("segment_timestamp_unit"),
         },
     }
 
-    filename = f"{candidate_id}_{window['window_id']}_{model_id.replace(':', '_')}.json"
+    filename = f"{candidate_id}.json"
     atomic_write_json(str(sd / "candidates" / filename), candidate)
 
     return candidate

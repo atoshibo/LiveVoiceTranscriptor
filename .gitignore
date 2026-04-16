@@ -2,3 +2,6 @@ models/
 .env
 data/sessions/
 data/worker_health.json
+*.zip
+.live_test_transcripts/
+*.wav

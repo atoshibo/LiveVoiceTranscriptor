@@ -9,6 +9,7 @@ The normalized timeline is the only timeline the rest of the pipeline should tru
 Output: normalized audio timeline + ingest metadata in normalized/ and raw/
 """
 import os
+import subprocess
 import wave
 import struct
 import logging
@@ -65,6 +66,137 @@ def _wav_duration_ms(path: str) -> int:
             return int(round((frames / max(1, sr)) * 1000))
     except Exception:
         return 0
+
+
+def split_file_upload_to_transport_chunks(
+    input_path: str,
+    output_dir: str,
+    transport_chunk_ms: int,
+) -> dict:
+    """Split a whole uploaded media file into canonical transport chunks."""
+    input_file = Path(input_path)
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    for stale in output_path.glob("chunk_*.wav"):
+        try:
+            stale.unlink()
+        except OSError:
+            logger.warning("Failed to remove stale transport chunk %s", stale)
+
+    if input_file.suffix.lower() == ".wav":
+        split_result = _split_wav_transport_chunks(input_file, output_path, transport_chunk_ms)
+        if split_result.get("success"):
+            return split_result
+        logger.warning("WAV split fallback failed for %s: %s", input_file, split_result.get("error"))
+
+    return _split_media_transport_chunks_ffmpeg(input_file, output_path, transport_chunk_ms)
+
+
+def _split_wav_transport_chunks(input_path: Path, output_dir: Path, transport_chunk_ms: int) -> dict:
+    try:
+        with wave.open(str(input_path), "rb") as wf:
+            params = wf.getparams()
+            frames_per_chunk = max(1, _ms_to_frames(transport_chunk_ms, params.framerate))
+            chunk_specs = []
+            chunk_index = 0
+
+            while True:
+                frames = wf.readframes(frames_per_chunk)
+                if not frames:
+                    break
+
+                chunk_path = output_dir / f"chunk_{chunk_index:04d}.wav"
+                with wave.open(str(chunk_path), "wb") as out:
+                    out.setnchannels(params.nchannels)
+                    out.setsampwidth(params.sampwidth)
+                    out.setframerate(params.framerate)
+                    out.writeframes(frames)
+
+                duration_ms = _wav_duration_ms(str(chunk_path))
+                chunk_specs.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "path": str(chunk_path),
+                        "chunk_started_ms": chunk_index * transport_chunk_ms,
+                        "chunk_duration_ms": duration_ms,
+                        "file_size": chunk_path.stat().st_size,
+                    }
+                )
+                chunk_index += 1
+
+        if not chunk_specs:
+            return {"success": False, "error": "no_chunks_emitted_from_wav"}
+
+        chunk_specs[-1]["is_final"] = True
+        for chunk in chunk_specs[:-1]:
+            chunk["is_final"] = False
+
+        return {
+            "success": True,
+            "method": "wave_split",
+            "chunk_count": len(chunk_specs),
+            "chunks": chunk_specs,
+        }
+    except Exception as e:
+        return {"success": False, "error": f"wav_split_failed:{e}"}
+
+
+def _split_media_transport_chunks_ffmpeg(input_path: Path, output_dir: Path, transport_chunk_ms: int) -> dict:
+    segment_seconds = max(1, int(round(transport_chunk_ms / 1000.0)))
+    output_pattern = str(output_dir / "chunk_%04d.wav")
+    cmd = [
+        "ffmpeg",
+        "-v",
+        "error",
+        "-y",
+        "-i",
+        str(input_path),
+        "-f",
+        "segment",
+        "-segment_time",
+        str(segment_seconds),
+        "-reset_timestamps",
+        "1",
+        "-c:a",
+        "pcm_s16le",
+        output_pattern,
+    ]
+    try:
+        completed = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except FileNotFoundError:
+        return {"success": False, "error": "ffmpeg_not_available"}
+    except Exception as e:
+        return {"success": False, "error": f"ffmpeg_execution_failed:{e}"}
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        return {"success": False, "error": f"ffmpeg_split_failed:{detail}"}
+
+    chunk_specs = []
+    for chunk_index, chunk_path in enumerate(sorted(output_dir.glob("chunk_*.wav"))):
+        duration_ms = _wav_duration_ms(str(chunk_path))
+        chunk_specs.append(
+            {
+                "chunk_index": chunk_index,
+                "path": str(chunk_path),
+                "chunk_started_ms": chunk_index * transport_chunk_ms,
+                "chunk_duration_ms": duration_ms,
+                "file_size": chunk_path.stat().st_size,
+                "is_final": False,
+            }
+        )
+
+    if not chunk_specs:
+        return {"success": False, "error": "ffmpeg_produced_no_chunks"}
+
+    chunk_specs[-1]["is_final"] = True
+    return {
+        "success": True,
+        "method": "ffmpeg_segment",
+        "chunk_count": len(chunk_specs),
+        "chunks": chunk_specs,
+    }
 
 
 def normalize_audio_file(input_path: str, output_path: str,

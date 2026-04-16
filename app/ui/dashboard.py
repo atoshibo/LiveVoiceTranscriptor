@@ -68,6 +68,21 @@ th{color:var(--text-dim);font-weight:500}
 .tab-bar button.active{color:var(--accent);border-bottom:2px solid var(--accent)}
 .upload-zone{border:2px dashed var(--border);border-radius:var(--radius);padding:40px;text-align:center;cursor:pointer}
 .upload-zone:hover{border-color:var(--accent)}
+.stack{display:flex;flex-direction:column;gap:12px}
+.muted{color:var(--text-dim)}
+.small{font-size:12px}
+.pill{display:inline-flex;align-items:center;gap:6px;padding:4px 10px;border:1px solid var(--border);border-radius:999px;font-size:12px}
+.queue-summary{padding:10px 12px;border:1px solid var(--border);border-radius:var(--radius);background:rgba(88,166,255,0.06)}
+.queue-actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:16px}
+.queue-actions button{flex:1;min-width:180px}
+.queue-table{width:100%;border-collapse:collapse;margin-top:8px}
+.queue-table th,.queue-table td{padding:8px 10px;vertical-align:top}
+.queue-table td:last-child,.queue-table th:last-child{text-align:right}
+.diag-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.section{margin-top:16px}
+.section:first-child{margin-top:0}
+.pre-box{background:var(--bg);border:1px solid var(--border);border-radius:var(--radius);padding:12px;overflow:auto;max-height:360px;white-space:pre-wrap}
+@media(max-width:768px){.diag-grid{grid-template-columns:1fr}}
 .kv{display:flex;gap:8px;margin-bottom:4px}
 .kv .k{color:var(--text-dim);min-width:160px;font-size:13px}
 .kv .v{font-size:13px}
@@ -125,11 +140,11 @@ th{color:var(--text-dim);font-weight:500}
   <div id="page-session-detail" class="hidden">
     <div class="card" id="session-header"></div>
     <div class="tab-bar">
-      <button class="active" onclick="showSessionTab('status')">Status</button>
-      <button onclick="showSessionTab('transcript')">Transcript</button>
-      <button onclick="showSessionTab('speaker')">Speaker</button>
-      <button onclick="showSessionTab('partial')">Partial</button>
-      <button onclick="showSessionTab('pipeline')">Pipeline</button>
+      <button class="active" data-session-tab="status" onclick="showSessionTab('status', this)">Status</button>
+      <button data-session-tab="transcript" onclick="showSessionTab('transcript', this)">Transcript</button>
+      <button data-session-tab="speaker" onclick="showSessionTab('speaker', this)">Speaker</button>
+      <button data-session-tab="partial" onclick="showSessionTab('partial', this)">Partial</button>
+      <button data-session-tab="pipeline" onclick="showSessionTab('pipeline', this)">Pipeline</button>
     </div>
     <div id="session-tab-content" class="card"></div>
   </div>
@@ -137,11 +152,11 @@ th{color:var(--text-dim);font-weight:500}
   <!-- Upload -->
   <div id="page-upload" class="hidden">
     <div class="card">
-      <h2>Upload Audio File</h2>
-      <p style="color:var(--text-dim);margin-bottom:16px">Upload a WAV file for transcription testing.</p>
+      <h2>Upload Audio Files</h2>
+      <p style="color:var(--text-dim);margin-bottom:16px">Choose one or more audio files. The UI will upload them one by one and place each session into the server queue.</p>
       <div class="grid">
-        <div>
-          <input type="file" id="upload-file" accept=".wav,.mp3,.ogg,.m4a">
+        <div class="stack">
+          <input type="file" id="upload-file" accept="audio/*,.wav,.mp3,.ogg,.m4a,.flac,.aac,.webm" multiple onchange="onUploadSelectionChanged()">
           <div style="margin-top:12px">
             <label style="font-size:13px;color:var(--text-dim)">Model</label>
             <select id="upload-model" style="margin-top:4px">
@@ -162,7 +177,19 @@ th{color:var(--text-dim);font-weight:500}
               <option value="es">Spanish</option>
             </select>
           </div>
-          <button onclick="startUpload()" style="margin-top:16px;width:100%">Upload & Transcribe</button>
+          <div style="margin-top:12px">
+            <label style="font-size:13px;color:var(--text-dim)">Diarization</label>
+            <select id="upload-diarization" style="margin-top:4px">
+              <option value="auto">Auto</option>
+              <option value="off">Off</option>
+              <option value="forced">Forced</option>
+            </select>
+          </div>
+          <div id="upload-selection-summary" class="queue-summary small">No files selected.</div>
+          <div class="queue-actions">
+            <button onclick="startUpload()">Queue Selected Files</button>
+            <button class="secondary" onclick="clearUploadSelection()">Clear Selection</button>
+          </div>
         </div>
         <div>
           <div id="upload-status" style="font-size:13px"></div>
@@ -189,6 +216,7 @@ th{color:var(--text-dim);font-weight:500}
 </div>
 
 <script>
+window.__LVT_USE_EXTERNAL_DASHBOARD__=true;
 const LS_KEY='lvt_token';
 let TOKEN=localStorage.getItem(LS_KEY)||'';
 let currentSession=null;
@@ -398,24 +426,18 @@ async function startUpload(){
   if(!fileInput.files.length){status.textContent='Select a file first.';return;}
 
   const file=fileInput.files[0];
-  status.innerHTML='<p>Creating session...</p>';
+  status.innerHTML='<p>Uploading file...</p>';
 
   try{
-    const sess=await apiJson('/api/v2/sessions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'file',source_type:'device_import'})});
-    const sid=sess.session_id;
-    status.innerHTML+=`<p>Session: ${sid.slice(0,8)}...</p><p>Uploading chunk...</p>`;
-
     const fd=new FormData();
-    fd.append('file',file);fd.append('chunk_index','0');fd.append('is_final','true');
-    fd.append('chunk_duration_ms',String(Math.round(file.size/32)));
-    await api(`/api/v2/sessions/${sid}/chunks`,{method:'POST',body:fd});
-    status.innerHTML+=`<p>Finalizing...</p>`;
-
-    const finBody={language:lang};
-    if(model==='auto')finBody.model_size='auto';
-    else{finBody.model_size=model;}
-    await apiJson(`/api/v2/sessions/${sid}/finalize`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(finBody)});
-    status.innerHTML+=`<p>Processing... <a onclick="openSession('${sid}')">View session</a></p>`;
+    fd.append('file',file);
+    fd.append('language',lang);
+    fd.append('model_size',model==='auto'?'auto':model);
+    fd.append('diarization','false');
+    const upload=await apiJson('/api/file-upload',{method:'POST',body:fd});
+    const sid=upload.session_id;
+    const chunkCount=upload.transport_chunk_count||1;
+    status.innerHTML+=`<p>Session: ${sid.slice(0,8)}...</p><p>Server split into ${chunkCount} transport chunk(s).</p><p>Processing... <a onclick="openSession('${sid}')">View session</a></p>`;
 
     // Poll
     let tries=0;
@@ -480,13 +502,16 @@ async function retrySession(sid){
 
 function escHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 
-// Init
-if(TOKEN){
-  apiJson('/api/v2/health').then(()=>{
-    document.getElementById('auth-gate').classList.add('hidden');
-    showPage('dashboard');
-  }).catch(()=>showAuthGate());
-} else showAuthGate();
+// Legacy inline bootstrap intentionally disabled in favor of /ui/dashboard.js
+if(!window.__LVT_USE_EXTERNAL_DASHBOARD__){
+  if(TOKEN){
+    apiJson('/api/v2/health').then(()=>{
+      document.getElementById('auth-gate').classList.add('hidden');
+      showPage('dashboard');
+    }).catch(()=>showAuthGate());
+  } else showAuthGate();
+}
 </script>
+<script src="/ui/dashboard.js"></script>
 </body>
 </html>"""

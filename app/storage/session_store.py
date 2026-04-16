@@ -13,6 +13,7 @@ artifact hierarchy:
     candidates/         - per-model raw ASR outputs
     reconciliation/     - stripe packets, arbitration outputs
     canonical/          - canonical segments + final transcript surfaces
+    enrichment/         - semantic markers grounded on canonical segments
     derived/            - subtitles, quality, classification, digests
     current/            - compatibility read surface (API reads from here)
     pipeline/           - pipeline run tracking
@@ -36,7 +37,7 @@ logger = logging.getLogger(__name__)
 # Internal storage layers (canonical spec section 11)
 STORAGE_LAYERS = [
     "chunks", "raw", "normalized", "triage", "windows",
-    "candidates", "reconciliation", "canonical", "derived", "current",
+    "candidates", "reconciliation", "canonical", "enrichment", "derived", "current",
     "pipeline",
 ]
 
@@ -113,6 +114,9 @@ def create_session(body: dict) -> dict:
         "last_chunk_at": None,
         "finalize_requested_at": None,
         "last_partial_trigger_at": None,
+        "last_live_trigger_at": None,
+        "last_live_trigger_chunk_count": 0,
+        "last_live_chunk_count_processed": 0,
         "run_diarization": False,
         "language": "auto",
         "model_size": "auto",

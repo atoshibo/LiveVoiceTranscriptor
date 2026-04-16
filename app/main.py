@@ -10,7 +10,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,9 +21,11 @@ from app.api.auth import _extract_token
 from app.api.auth import require_auth_upload
 from app.core.config import get_config
 from app.core.tls import ensure_tls_assets
+from app.pipeline.ingest import split_file_upload_to_transport_chunks
 from app.storage.session_store import (
     cleanup_abandoned_draft_sessions,
     create_session,
+    delete_session,
     get_session_meta,
     list_sessions,
     register_chunk,
@@ -218,59 +220,106 @@ async def legacy_file_upload(
     language: str = Form("auto"),
     model_size: str = Form("auto"),
     diarization: bool = Form(False),
+    diarization_policy: str = Form(""),
     token: str = Depends(require_auth_upload),
 ):
     cfg = get_config()
     session = create_session({"mode": "file", "source_type": "device_import"})
     session_id = session["session_id"]
     sd = session_dir(session_id)
+    raw_dir = sd / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
-    content = await file.read()
-    if len(content) > cfg.worker.max_chunk_mb * 1024 * 1024:
-        return JSONResponse(status_code=413, content={"detail": "Uploaded file exceeds max chunk size."})
+    suffix = Path(file.filename or "upload.wav").suffix or ".wav"
+    raw_upload_path = raw_dir / f"uploaded{suffix}"
+    upload_limit_bytes = cfg.worker.max_file_upload_mb * 1024 * 1024
+    total_bytes = 0
 
-    chunk_path = sd / "chunks" / "chunk_0000.wav"
-    chunk_path.parent.mkdir(parents=True, exist_ok=True)
-    chunk_path.write_bytes(content)
-    register_chunk(
-        session_id,
-        0,
-        {
-            "chunk_index": 0,
-            "chunk_started_ms": 0,
-            "chunk_duration_ms": 0,
-            "is_final": True,
-            "file_size": len(content),
-        },
-    )
-    update_session_meta(
-        session_id,
-        {
-            "state": "finalized",
-            "language": language,
-            "model_size": model_size,
-            "run_diarization": diarization,
-            "diarization_policy": "forced" if diarization else "off",
-            "finalize_requested_at": datetime.now(timezone.utc).isoformat(),
-        },
-    )
-    update_status(session_id, "uploaded")
-    _enqueue_job(
-        session_id,
-        get_session_meta(session_id) or {},
-        {
-            "language": language,
-            "model_size": model_size,
-            "run_diarization": diarization,
-            "diarization_policy": "forced" if diarization else "off",
-        },
-    )
-    return {
-        "accepted": True,
-        "session_id": session_id,
-        "job_id": session_id,
-        "status_url": f"/api/v2/jobs/{session_id}",
-    }
+    try:
+        with raw_upload_path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > upload_limit_bytes:
+                    raise ValueError(
+                        f"Uploaded file exceeds {cfg.worker.max_file_upload_mb}MB limit."
+                    )
+                out.write(chunk)
+
+        split_result = split_file_upload_to_transport_chunks(
+            str(raw_upload_path),
+            str(sd / "chunks"),
+            cfg.geometry.transport_chunk_ms,
+        )
+        if not split_result.get("success"):
+            raise RuntimeError(split_result.get("error", "transport_chunk_split_failed"))
+
+        for chunk_spec in split_result.get("chunks", []):
+            register_chunk(
+                session_id,
+                chunk_spec["chunk_index"],
+                {
+                    "chunk_index": chunk_spec["chunk_index"],
+                    "chunk_started_ms": chunk_spec["chunk_started_ms"],
+                    "chunk_duration_ms": chunk_spec["chunk_duration_ms"],
+                    "is_final": chunk_spec.get("is_final", False),
+                    "file_size": chunk_spec.get("file_size", 0),
+                },
+            )
+
+        resolved_diarization_policy = (
+            str(diarization_policy).strip().lower()
+            if str(diarization_policy).strip()
+            else ("forced" if diarization else "auto")
+        )
+        if resolved_diarization_policy not in {"auto", "off", "forced"}:
+            raise ValueError("Invalid diarization_policy. Allowed: auto, off, forced.")
+        run_diarization = resolved_diarization_policy == "forced"
+
+        update_session_meta(
+            session_id,
+            {
+                "state": "finalized",
+                "language": language,
+                "model_size": model_size,
+                "run_diarization": run_diarization,
+                "diarization_policy": resolved_diarization_policy,
+                "finalize_requested_at": datetime.now(timezone.utc).isoformat(),
+                "original_filename": file.filename,
+                "original_file_size": total_bytes,
+                "transport_chunk_count": split_result.get("chunk_count", 0),
+                "transport_chunking_method": split_result.get("method"),
+            },
+        )
+        update_status(session_id, "uploaded")
+        _enqueue_job(
+            session_id,
+            get_session_meta(session_id) or {},
+            {
+                "language": language,
+                "model_size": model_size,
+                "run_diarization": run_diarization,
+                "diarization_policy": resolved_diarization_policy,
+            },
+        )
+        return {
+            "accepted": True,
+            "session_id": session_id,
+            "job_id": session_id,
+            "status_url": f"/api/v2/jobs/{session_id}",
+            "transport_chunk_count": split_result.get("chunk_count", 0),
+        }
+    except ValueError as e:
+        delete_session(session_id)
+        return JSONResponse(status_code=413, content={"detail": str(e)})
+    except Exception as e:
+        logger.exception("Whole-file upload failed for session %s", session_id)
+        delete_session(session_id)
+        return JSONResponse(status_code=500, content={"detail": f"File upload failed: {e}"})
+    finally:
+        await file.close()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -278,6 +327,12 @@ async def root():
     from app.ui.dashboard import get_ui_html
 
     return HTMLResponse(content=get_ui_html())
+
+
+@app.get("/ui/dashboard.js")
+async def dashboard_js():
+    ui_js_path = Path(__file__).resolve().parent / "ui" / "dashboard.js"
+    return FileResponse(str(ui_js_path), media_type="application/javascript")
 
 
 def _uvicorn_kwargs() -> dict:

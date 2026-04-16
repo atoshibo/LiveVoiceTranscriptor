@@ -51,7 +51,8 @@ def _bridge_crosses_speech_boundary(
 def build_decode_windows(total_duration_ms: int,
                          speech_islands: List[Dict] = None,
                          window_ms: int = None,
-                         stride_ms: int = None) -> List[Dict]:
+                         stride_ms: int = None,
+                         allow_trailing_partial_window: bool = True) -> List[Dict]:
     """Build the decode window lattice from the normalized timeline.
 
     Args:
@@ -73,6 +74,8 @@ def build_decode_windows(total_duration_ms: int,
 
     while start_ms < total_duration_ms:
         end_ms = min(start_ms + window_ms, total_duration_ms)
+        if not allow_trailing_partial_window and (end_ms - start_ms) < window_ms:
+            break
 
         # Determine window type
         # First window at each chunk boundary is "full", bridge windows span boundaries
@@ -161,7 +164,7 @@ def extract_window_audio(audio_path: str, window: Dict,
 
 def run_decode_lattice(session_id: str, audio_path: str,
                        audio_duration_ms: int, speech_islands: Optional[List[Dict]],
-                       stage) -> dict:
+                       stage, allow_trailing_partial_window: bool = True) -> dict:
     """Execute decode lattice construction stage.
 
     1. Build window definitions
@@ -172,7 +175,11 @@ def run_decode_lattice(session_id: str, audio_path: str,
     windows_dir = str(sd / "windows")
 
     # Build windows
-    windows = build_decode_windows(audio_duration_ms, speech_islands)
+    windows = build_decode_windows(
+        audio_duration_ms,
+        speech_islands,
+        allow_trailing_partial_window=allow_trailing_partial_window,
+    )
 
     # Extract audio for scheduled windows
     for window in windows:

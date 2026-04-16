@@ -15,9 +15,7 @@ services:
   server:
     build:
       context: .
-      target: server
-      args:
-        INSTALL_OPTIONAL_MODEL_DEPS: "true"
+      dockerfile: Dockerfile
     env_file:
       - .env
     ports:
@@ -45,10 +43,7 @@ services:
   worker:
     build:
       context: .
-      target: worker
-      args:
-        INSTALL_OPTIONAL_MODEL_DEPS: "true"
-        PYTORCH_EXTRA_INDEX_URL: "https://download.pytorch.org/whl/cu124"
+      dockerfile: Dockerfile.worker
     env_file:
       - .env
     environment:
@@ -56,12 +51,28 @@ services:
       REDIS_HOST: redis
       REDIS_PORT: 6379
       MODELS_DIR: /models
-      STRICT_CUDA: "false"
+      HF_HOME: /models
+      HUGGINGFACE_HUB_CACHE: /models
+      TRANSFORMERS_CACHE: /models
       TLS_ENABLED: "false"
+      # --- GPU configuration ---
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cuda}
+      WHISPER_STRICT_CUDA: ${WHISPER_STRICT_CUDA:-1}
+      WHISPER_COMPUTE_TYPE: ${WHISPER_COMPUTE_TYPE:-float16}
+      WHISPER_COMPUTE_TYPE_FALLBACKS: ${WHISPER_COMPUTE_TYPE_FALLBACKS:-int8_float16,int8}
+      CUDA_DEVICE_INDEX: ${CUDA_DEVICE_INDEX:-0}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True,max_split_size_mb:512
+      # --- Reconciliation LLM ---
+      RECONCILIATION_MODEL_PATH: ${RECONCILIATION_MODEL_PATH:-}
+      RECONCILIATION_N_GPU_LAYERS: ${RECONCILIATION_N_GPU_LAYERS:-28}
     volumes:
       - ${HOST_SESSIONS_DIR:-./data/sessions}:/data/sessions
       - ${HOST_MODELS_DIR:-./models}:/models:ro
-    gpus: all
+    runtime: nvidia
+    shm_size: '2gb'
     depends_on:
       redis:
         condition: service_healthy

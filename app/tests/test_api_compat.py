@@ -79,6 +79,24 @@ class TestSessionCreation:
         assert meta["state"] == "created"
 
 
+class TestWholeFileUploadChunking:
+    def test_split_file_upload_into_transport_chunks(self, tmp_path, make_wav_file):
+        from app.pipeline.ingest import split_file_upload_to_transport_chunks
+
+        wav_path = make_wav_file(name="long.wav", duration_s=65.0)
+        out_dir = tmp_path / "chunks"
+
+        result = split_file_upload_to_transport_chunks(wav_path, str(out_dir), 30000)
+
+        assert result["success"] is True
+        assert result["chunk_count"] == 3
+        durations = [chunk["chunk_duration_ms"] for chunk in result["chunks"]]
+        assert 29900 <= durations[0] <= 30100
+        assert 29900 <= durations[1] <= 30100
+        assert 4900 <= durations[2] <= 5100
+        assert result["chunks"][-1]["is_final"] is True
+
+
 class TestSessionListSummaries:
     def test_list_sessions_sorted_by_activity_time(self, tmp_sessions_dir, monkeypatch):
         from app.storage import session_store
@@ -354,3 +372,29 @@ class TestJobEnqueueContract:
         assert payload["allowed_languages"] == ["fr"]
         assert payload["diarization_policy"] == "forced"
         assert payload["run_diarization"] is True
+
+    def test_live_trigger_enqueues_canonical_live_job(self, tmp_sessions_dir, monkeypatch):
+        from app.api import api_v2
+        from app.core.config import get_config
+        from app.storage.session_store import create_session, get_session_meta, session_dir
+
+        pushed = []
+
+        class DummyRedis:
+            def rpush(self, queue, payload):
+                pushed.append((queue, payload))
+
+        sid = create_session({"mode": "stream"})["session_id"]
+        meta = get_session_meta(sid) or {}
+
+        monkeypatch.setattr(api_v2, "_get_redis", lambda: DummyRedis())
+
+        api_v2._maybe_trigger_live_canonical(sid, 5, meta)
+
+        assert len(pushed) == 1
+        queue_name, raw_payload = pushed[0]
+        assert queue_name == get_config().redis.partial_queue
+        payload = json.loads(raw_payload)
+        assert payload["job_type"] == "v2_canonical_live"
+        assert payload["session_id"] == sid
+        assert (session_dir(sid) / "live_canonical_pending").is_file()

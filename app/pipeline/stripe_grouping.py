@@ -136,6 +136,8 @@ def group_evidence_by_stripe(stripes: List[Dict], windows: List[Dict],
                         "language_evidence": c.get("language_evidence", {}),
                         "candidate_success": c.get("confidence_features", {}).get("success", False),
                         "candidate_degraded": c.get("confidence_features", {}).get("degraded", False),
+                        "candidate_flags": list(c.get("candidate_flags") or []),
+                        "witness_audit": c.get("witness_audit") or {},
                     })
                     model_ids_seen.add(c.get("model_id"))
 

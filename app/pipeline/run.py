@@ -17,12 +17,16 @@ Canonical stages aligned to the pipeline specification:
   3. decode_lattice
   4. first_pass_medium
   5. candidate_asr_large_v3
-  6. candidate_asr_parakeet
+  6. candidate_asr_secondary
   7. stripe_grouping
   8. reconciliation
   9. canonical_assembly
   10. selective_enrichment
-  11. derived_outputs
+  11. semantic_marking
+  12. memory_graph_update
+  13. derived_outputs
+  14. nosql_projection
+  15. thread_linking
 """
 import os
 import uuid
@@ -40,6 +44,7 @@ logger = logging.getLogger(__name__)
 STAGE_PENDING = "pending"
 STAGE_RUNNING = "running"
 STAGE_DONE = "done"
+STAGE_DEGRADED = "degraded"   # completed but provider crashed / all witnesses failed
 STAGE_ERROR = "error"
 STAGE_SKIPPED = "skipped"
 
@@ -56,35 +61,88 @@ CANONICAL_V1_STAGES = [
     "decode_lattice",
     "first_pass_medium",
     "candidate_asr_large_v3",
-    "candidate_asr_parakeet",      # Was: candidate_asr_turbo_hf
+    "candidate_asr_secondary",
     "stripe_grouping",
     "reconciliation",
     "canonical_assembly",
     "selective_enrichment",
+    "semantic_marking",
+    "memory_graph_update",
     "derived_outputs",
+    "nosql_projection",
+    "thread_linking",
 ]
 
 # Legacy stages kept for backward-compat detection
 LEGACY_STAGES = [
     "transcribe", "diarization", "quality", "clean",
     "classify", "coverage", "subtitles",
+    "candidate_asr_parakeet",
     "candidate_asr_turbo_hf",  # Old turbo stage name
 ]
+
+STAGE_NAME_ALIASES = {
+    "candidate_asr_parakeet": "candidate_asr_secondary",
+    "candidate_asr_turbo_hf": "candidate_asr_secondary",
+}
+
+
+def normalize_stage_name(name: str) -> str:
+    return STAGE_NAME_ALIASES.get(name, name)
+
+
+def stage_directory_candidates(name: str) -> List[str]:
+    normalized = normalize_stage_name(name)
+    candidates = [normalized]
+    for legacy_name, current_name in STAGE_NAME_ALIASES.items():
+        if current_name == normalized and legacy_name not in candidates:
+            candidates.append(legacy_name)
+    return candidates
+
+
+def _canonicalize_stage_names(stage_names: Optional[List[str]]) -> List[str]:
+    names = list(stage_names or CANONICAL_V1_STAGES)
+    normalized = [normalize_stage_name(name) for name in names]
+    merged: List[str] = []
+
+    for name in CANONICAL_V1_STAGES:
+        if name not in merged:
+            merged.append(name)
+
+    for name in normalized:
+        if name not in merged:
+            merged.append(name)
+
+    return merged
+
+
+def migrate_run_stage_layout(run_dir: Path) -> None:
+    stages_root = run_dir / "stages"
+    if not stages_root.is_dir():
+        return
+
+    for legacy_name, current_name in STAGE_NAME_ALIASES.items():
+        legacy_dir = stages_root / legacy_name
+        current_dir = stages_root / current_name
+        if legacy_dir.is_dir() and not current_dir.exists():
+            legacy_dir.rename(current_dir)
 
 
 class StageRun:
     """Tracks execution of a single pipeline stage."""
 
     def __init__(self, name: str, run_dir: Path):
-        self.name = name
+        self.name = normalize_stage_name(name)
         self.run_dir = run_dir
-        self.stage_dir = run_dir / "stages" / name
+        self.stage_dir = self._resolve_stage_dir()
         self.stage_dir.mkdir(parents=True, exist_ok=True)
         self.status = STAGE_PENDING
         self.started_at: Optional[str] = None
         self.finished_at: Optional[str] = None
         self.error: Optional[str] = None
         self.artifacts: List[str] = []
+        self.actual_model: Optional[str] = None   # what model actually ran
+        self.routing_reason: Optional[str] = None  # why this model was chosen
 
     def start(self) -> "StageRun":
         self.status = STAGE_RUNNING
@@ -106,7 +164,11 @@ class StageRun:
         self._save()
 
     def commit_with_fallback(self, artifacts: List[str] = None, reason: str = "") -> None:
-        """Mark as done but record fallback reason for auditability."""
+        """Mark as done but record fallback reason for auditability.
+
+        Use this for expected graceful degradation (e.g. candidate B skipped
+        because the session is non-English).
+        """
         self.status = STAGE_DONE
         self.finished_at = datetime.now(timezone.utc).isoformat()
         self.error = f"fallback: {reason}" if reason else "fallback: unknown"
@@ -120,6 +182,28 @@ class StageRun:
         # Write fallback marker
         atomic_write_json(
             str(self.stage_dir / "_fallback.json"),
+            {"reason": reason, "timestamp": self.finished_at}
+        )
+        self._save()
+
+    def commit_degraded(self, reason: str, artifacts: List[str] = None) -> None:
+        """Mark stage as degraded: provider crashed or all witnesses failed.
+
+        Pipeline continues but the failure is visible in audit.  This is
+        NOT hidden behind 'done'.
+        """
+        self.status = STAGE_DEGRADED
+        self.finished_at = datetime.now(timezone.utc).isoformat()
+        self.error = reason
+        if artifacts:
+            self.artifacts = artifacts
+        else:
+            self.artifacts = [
+                f.name for f in self.stage_dir.iterdir()
+                if f.name != "stage_meta.json"
+            ]
+        atomic_write_json(
+            str(self.stage_dir / "_degraded.json"),
             {"reason": reason, "timestamp": self.finished_at}
         )
         self._save()
@@ -145,23 +229,42 @@ class StageRun:
             "error": self.error,
             "artifacts": self.artifacts,
             "fallback": self.error.startswith("fallback:") if self.error else False,
+            "degraded": self.status == STAGE_DEGRADED,
+            "actual_model": self.actual_model,
+            "routing_reason": self.routing_reason,
         }
 
     def _save(self) -> None:
         atomic_write_json(str(self.stage_dir / "stage_meta.json"), self.to_dict())
 
+    def _resolve_stage_dir(self) -> Path:
+        stages_root = self.run_dir / "stages"
+        normalized_dir = stages_root / self.name
+        if normalized_dir.exists():
+            return normalized_dir
+
+        for candidate in stage_directory_candidates(self.name)[1:]:
+            legacy_dir = stages_root / candidate
+            if legacy_dir.exists():
+                return legacy_dir
+
+        return normalized_dir
+
     @classmethod
     def from_disk(cls, name: str, run_dir: Path) -> "StageRun":
-        stage = cls(name, run_dir)
+        stage = cls(normalize_stage_name(name), run_dir)
         meta_path = stage.stage_dir / "stage_meta.json"
         if meta_path.is_file():
             data = safe_read_json(str(meta_path))
             if data:
+                stage.name = normalize_stage_name(data.get("name", stage.name))
                 stage.status = data.get("status", STAGE_PENDING)
                 stage.started_at = data.get("started_at")
                 stage.finished_at = data.get("finished_at")
                 stage.error = data.get("error")
                 stage.artifacts = data.get("artifacts", [])
+                stage.actual_model = data.get("actual_model")
+                stage.routing_reason = data.get("routing_reason")
         return stage
 
 
@@ -174,7 +277,8 @@ class PipelineRun:
         self.session_dir = Path(session_dir)
         self.run_id = run_id
         self.run_type = run_type
-        self._stage_names = stage_names or list(CANONICAL_V1_STAGES)
+        migrate_run_stage_layout(self.run_dir)
+        self._stage_names = _canonicalize_stage_names(stage_names)
         self.status = RUN_PENDING
         self.started_at: Optional[str] = None
         self.finished_at: Optional[str] = None
@@ -199,6 +303,10 @@ class PipelineRun:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         atomic_write_json(str(self.config_snapshot_path), config_snapshot)
         self._save()
+        # Point canonical_run_id at this run immediately so interrupted runs are
+        # discoverable by resume/audit tooling.  complete() re-writes the same
+        # value on success, which is safe and idempotent.
+        self._set_canonical_run_id()
 
     def start(self) -> None:
         self.status = RUN_RUNNING
@@ -218,9 +326,10 @@ class PipelineRun:
         self._save()
 
     def get_stage(self, name: str) -> StageRun:
-        if name not in self._stages:
+        normalized = normalize_stage_name(name)
+        if normalized not in self._stages:
             raise ValueError(f"Unknown stage: {name}. Valid stages: {self._stage_names}")
-        return self._stages[name]
+        return self._stages[normalized]
 
     def start_stage(self, name: str) -> StageRun:
         stage = self.get_stage(name)
@@ -230,7 +339,7 @@ class PipelineRun:
 
     def is_stage_done(self, name: str) -> bool:
         stage = self.get_stage(name)
-        return stage.status in (STAGE_DONE, STAGE_SKIPPED)
+        return stage.status in (STAGE_DONE, STAGE_SKIPPED, STAGE_DEGRADED)
 
     def skip_stage(self, name: str, reason: str = "") -> None:
         self.get_stage(name).skip(reason)
@@ -295,8 +404,29 @@ def create_canonical_run(session_dir: str, session_id: str,
 def get_canonical_run_id(session_dir: str) -> Optional[str]:
     pointer = Path(session_dir) / "pipeline" / "canonical_run_id.txt"
     if pointer.is_file():
-        return pointer.read_text(encoding="utf-8").strip()
-    return None
+        run_id = pointer.read_text(encoding="utf-8").strip()
+        if run_id:
+            return run_id
+    # Fallback: pointer missing (older runs or interrupted before initialize
+    # wrote the pointer).  Pick the most recently started run_meta.json under
+    # pipeline/runs/ so resume/audit tooling can still find orphaned runs.
+    runs_dir = Path(session_dir) / "pipeline" / "runs"
+    if not runs_dir.is_dir():
+        return None
+    candidates = []
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        meta_path = run_dir / "run_meta.json"
+        if not meta_path.is_file():
+            continue
+        data = safe_read_json(str(meta_path)) or {}
+        started = data.get("started_at") or ""
+        candidates.append((started, run_dir.name))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 def get_canonical_run(session_dir: str) -> Optional[PipelineRun]:

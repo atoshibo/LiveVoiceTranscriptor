@@ -14,7 +14,7 @@ import uuid
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, FileResponse
@@ -31,10 +31,66 @@ from app.models.registry import (
     get_registry, resolve_model_id, get_model_info, list_all_models,
     VALID_MODEL_SIZES,
 )
+from app.pipeline.run import normalize_stage_name, stage_directory_candidates
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v2", tags=["v2"])
+
+
+def _load_quality_gate(sd: Path) -> Dict[str, Any]:
+    from app.pipeline.canonical_assembly import read_quality_gate
+    return safe_read_json(str(sd / "canonical" / "quality_gate.json")) or read_quality_gate(sd.name)
+
+
+def _load_context_spans_payload(sd: Path) -> Dict[str, Any]:
+    return safe_read_json(str(sd / "enrichment" / "context_spans.json")) or {}
+
+
+def _load_retrieval_payload(sd: Path) -> Optional[Dict[str, Any]]:
+    derived = sd / "derived"
+    current = sd / "current"
+    return (
+        safe_read_json(str(derived / "retrieval_index_v3.json"))
+        or safe_read_json(str(current / "retrieval_index_v3.json"))
+        or safe_read_json(str(derived / "retrieval_index_v2.json"))
+        or safe_read_json(str(current / "retrieval_index_v2.json"))
+        or safe_read_json(str(derived / "retrieval_index.json"))
+        or safe_read_json(str(current / "retrieval_index.json"))
+    )
+
+
+def _build_diarization_summary(sd: Path, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    meta = meta or {}
+    status_payload = safe_read_json(str(sd / "canonical" / "diarization_status.json")) or {}
+    speaker_turns_payload = safe_read_json(str(sd / "canonical" / "speaker_turns.json")) or {}
+
+    policy = status_payload.get("policy")
+    if policy is None:
+        policy = str(meta.get("diarization_policy", "auto")).strip().lower() or "auto"
+
+    requested = status_payload.get("requested")
+    if requested is None:
+        requested = bool(meta.get("run_diarization")) or policy == "forced"
+
+    status = status_payload.get("status")
+    if status is None:
+        if policy == "off":
+            status = "not_requested"
+        elif requested:
+            status = "pending"
+        else:
+            status = "auto_pending"
+
+    return {
+        "policy": policy,
+        "requested": requested,
+        "reason": status_payload.get("reason"),
+        "available": status_payload.get("available"),
+        "status": status,
+        "speakers": (speaker_turns_payload or {}).get("speakers") or [],
+        "turn_count": (speaker_turns_payload or {}).get("turn_count", 0),
+    }
 
 
 # ============================================================
@@ -274,9 +330,9 @@ async def upload_chunk(
         if meta and meta.get("state") == "receiving":
             update_session_meta(session_id, {"state": "chunks_complete"})
 
-    # Partial trigger (stream mode only, not is_final)
+    # Canonical live trigger (stream mode only, not is_final)
     if not is_final and meta.get("mode") == "stream":
-        _maybe_trigger_partial(session_id, total_chunks, meta)
+        _maybe_trigger_live_canonical(session_id, total_chunks, meta)
 
     return {
         "accepted": True,
@@ -371,7 +427,13 @@ async def finalize_session(session_id: str, request: Request,
     diarization_policy = body.get("diarization_policy")
     if diarization_policy is None:
         if diarization_flag_present:
-            diarization_policy = "forced" if diarization_flag else "off"
+            # A caller explicitly set run_diarization=False but without a
+            # policy — respect it as the "no diarization" signal but surface
+            # it as "auto" for file imports, so our selective trigger still
+            # runs the work when content clearly warrants it (long audio,
+            # multi-voice filename hints).  Truly disabling diarization now
+            # requires sending diarization_policy="off" explicitly.
+            diarization_policy = "forced" if diarization_flag else "auto"
         else:
             diarization_policy = meta.get("diarization_policy", "auto")
     diarization_policy = str(diarization_policy).strip().lower()
@@ -551,12 +613,19 @@ async def get_job_status(job_id: str, token: str = Depends(require_auth)):
     partial_available = (sd / "partial_transcript.json").is_file()
     partial_preview = status_data.get("partial_preview") if state == "running" else None
 
+    diarization = _build_diarization_summary(sd, metadata)
+    quality_gate = _load_quality_gate(sd)
+    context_spans_payload = _load_context_spans_payload(sd)
+
     # Build meta
     job_meta = {
         "language_requested": metadata.get("language"),
         "model_size": metadata.get("model_size"),
         "speaker_count": metadata.get("speaker_count"),
-        "diarization_enabled": metadata.get("run_diarization", False),
+        "diarization_enabled": bool(diarization.get("requested")),
+        "diarization": diarization,
+        "quality_gate": quality_gate,
+        "context_span_count": (context_spans_payload or {}).get("span_count", 0),
     }
 
     if metadata.get("language_candidates"):
@@ -592,6 +661,9 @@ async def get_job_status(job_id: str, token: str = Depends(require_auth)):
         "queued_at": queued_at,
         "started_at": started_at,
         "finished_at": finished_at,
+        "diarization": diarization,
+        "quality_gate": quality_gate,
+        "context_span_count": (context_spans_payload or {}).get("span_count", 0),
         "meta": job_meta,
     }
 
@@ -626,6 +698,7 @@ async def get_session_status(session_id: str, token: str = Depends(require_auth)
     meta = get_session_meta(session_id) or {}
     status_data = get_status(session_id) or {}
     sd = session_dir(session_id)
+    metadata = safe_read_json(str(sd / "metadata.json")) or {}
 
     # Derive state
     session_state = meta.get("state", "created")
@@ -658,6 +731,10 @@ async def get_session_status(session_id: str, token: str = Depends(require_auth)
             if err:
                 error_message = err.get("error_message", "Unknown error")
 
+    diarization = _build_diarization_summary(sd, metadata or meta)
+    quality_gate = _load_quality_gate(sd)
+    context_spans_payload = _load_context_spans_payload(sd)
+
     return {
         "session_id": session_id,
         "state": state,
@@ -685,6 +762,13 @@ async def get_session_status(session_id: str, token: str = Depends(require_auth)
         "progress": status_data.get("progress", {"upload": 0, "processing": 0, "stage": "pending"}),
         "mode": meta.get("mode", "stream"),
         "device_id": meta.get("device_id"),
+        "language": metadata.get("language", meta.get("language", "auto")),
+        "model_size": metadata.get("model_size", meta.get("model_size", "auto")),
+        "original_filename": meta.get("original_filename"),
+        "diarization_enabled": bool(diarization.get("requested")),
+        "diarization": diarization,
+        "quality_gate": quality_gate,
+        "context_span_count": (context_spans_payload or {}).get("span_count", 0),
     }
 
 
@@ -740,13 +824,40 @@ async def get_transcript(session_id: str, token: str = Depends(require_auth)):
             },
         )
 
-    final_surface = safe_read_json(str(sd / "current" / "final_transcript.json")) or safe_read_json(str(sd / "final_transcript.json"))
-    stabilized_surface = safe_read_json(str(sd / "current" / "stabilized_partial.json")) or safe_read_json(str(sd / "stabilized_partial.json"))
-    provisional_surface = safe_read_json(str(sd / "current" / "provisional_partial.json")) or safe_read_json(str(sd / "provisional_partial.json"))
-
-    # Resolve read layer: prefer current/, fallback to session root
+    # Canonical spec 16.1: prefer canonical/ and derived/ over compatibility
+    # copies in current/.  current/ is the last-resort read layer, kept for
+    # older clients.
+    canonical = sd / "canonical"
+    derived = sd / "derived"
     current = sd / "current"
-    read_dir = current if _has_any_transcript_file(current) else sd
+
+    final_surface = (
+        safe_read_json(str(canonical / "final_transcript.json"))
+        or safe_read_json(str(derived / "final_transcript.json"))
+        or safe_read_json(str(current / "final_transcript.json"))
+        or safe_read_json(str(sd / "final_transcript.json"))
+    )
+    stabilized_surface = (
+        safe_read_json(str(canonical / "stabilized_partial.json"))
+        or safe_read_json(str(derived / "stabilized_partial.json"))
+        or safe_read_json(str(current / "stabilized_partial.json"))
+        or safe_read_json(str(sd / "stabilized_partial.json"))
+    )
+    provisional_surface = (
+        safe_read_json(str(canonical / "provisional_partial.json"))
+        or safe_read_json(str(derived / "provisional_partial.json"))
+        or safe_read_json(str(current / "provisional_partial.json"))
+        or safe_read_json(str(sd / "provisional_partial.json"))
+    )
+
+    # Resolve read layer for derived artifacts (clean, quality, etc.).
+    # Prefer derived/, then current/, then session root.
+    if _has_any_transcript_file(derived):
+        read_dir = derived
+    elif _has_any_transcript_file(current):
+        read_dir = current
+    else:
+        read_dir = sd
 
     # Load text
     text = (final_surface or {}).get("text", "")
@@ -807,12 +918,24 @@ async def get_transcript(session_id: str, token: str = Depends(require_auth)):
     if not reading_text:
         reading_text = text
 
+    # Semantic markers + retrieval grounding (enrichment layer).  Canonical
+    # spec 16.1: markers/retrieval are part of the transcript read contract,
+    # not a hidden sidecar.
+    markers_payload = safe_read_json(str(sd / "enrichment" / "segment_markers.json"))
+    markers = (markers_payload or {}).get("markers") or []
+    spans_payload = safe_read_json(str(sd / "enrichment" / "semantic_spans.json"))
+    context_spans_payload = _load_context_spans_payload(sd)
+    retrieval_payload = _load_retrieval_payload(sd)
+    diarization = _build_diarization_summary(sd, get_session_meta(session_id) or {})
+    quality_gate = _load_quality_gate(sd)
+
     return {
         "session_id": session_id,
         "text": text,
         "raw_text": text,
         "clean_text": clean.get("clean_text") if clean else None,
         "paragraphs": clean.get("paragraphs") if clean else None,
+        "dropped_segments": clean.get("dropped_segments") if clean else None,
         "reading_text": reading_text,
         "speaker_timestamped": speaker_text,
         "segments": segments,
@@ -823,15 +946,61 @@ async def get_transcript(session_id: str, token: str = Depends(require_auth)):
             "stabilized_partial_available": stabilized_surface is not None,
             "final_transcript_available": final_surface is not None,
         },
+        "markers": markers,
+        "semantic_spans": (spans_payload or {}).get("spans") or [],
+        "context_spans": (context_spans_payload or {}).get("spans") or [],
+        "retrieval_summary": {
+            "entry_count": (retrieval_payload or {}).get("entry_count", 0),
+            "excluded_count": (retrieval_payload or {}).get("excluded_count", 0),
+            "version": (retrieval_payload or {}).get("version"),
+            "source": (retrieval_payload or {}).get("source"),
+            "url": f"/api/v2/sessions/{session_id}/retrieval",
+        },
+        "diarization": diarization,
+        "quality_gate": quality_gate,
         "formats": {
             "srt_url": f"/api/v2/sessions/{session_id}/subtitle.srt",
             "vtt_url": f"/api/v2/sessions/{session_id}/subtitle.vtt",
             "speaker_timestamped_url": f"/api/v2/sessions/{session_id}/transcript/speaker",
+            "markers_url": f"/api/v2/sessions/{session_id}/markers",
+            "retrieval_url": f"/api/v2/sessions/{session_id}/retrieval",
         },
         "quality_report": quality,
         "source_integrity": source_integrity,
         "classification": classification,
     }
+
+
+@router.get("/sessions/{session_id}/markers")
+async def get_markers(session_id: str, token: str = Depends(require_auth)):
+    """Return the enrichment layer's semantic markers + spans."""
+    sd = session_dir(session_id)
+    if not sd.is_dir():
+        raise HTTPException(404, detail=f"Session {session_id} not found.")
+    markers = safe_read_json(str(sd / "enrichment" / "segment_markers.json")) or {}
+    spans = safe_read_json(str(sd / "enrichment" / "semantic_spans.json")) or {}
+    context_spans = _load_context_spans_payload(sd)
+    audit = safe_read_json(str(sd / "enrichment" / "marker_audit.json")) or {}
+    return {
+        "session_id": session_id,
+        "markers": markers.get("markers") or [],
+        "spans": spans.get("spans") or [],
+        "semantic_spans": spans.get("spans") or [],
+        "context_spans": context_spans.get("spans") or [],
+        "audit": audit,
+    }
+
+
+@router.get("/sessions/{session_id}/retrieval")
+async def get_retrieval(session_id: str, token: str = Depends(require_auth)):
+    """Return the best available retrieval payload, preferring context-aware v3."""
+    sd = session_dir(session_id)
+    if not sd.is_dir():
+        raise HTTPException(404, detail=f"Session {session_id} not found.")
+    payload = _load_retrieval_payload(sd)
+    if payload is None:
+        raise HTTPException(404, detail="Retrieval index not available yet.")
+    return payload
 
 
 @router.get("/sessions/{session_id}/transcript/stabilized")
@@ -957,6 +1126,23 @@ async def get_session_detail(session_id: str, token: str = Depends(require_auth)
         err = safe_read_json(str(sd / "error.json"))
         error_msg = err.get("error_message") if err else status_data.get("error")
 
+    # Pipeline audit: full execution trace for canonical runs
+    pipeline_audit = _build_pipeline_audit(sd)
+    diarization = _build_diarization_summary(sd, meta)
+    quality_gate = _load_quality_gate(sd)
+    context_spans_payload = _load_context_spans_payload(sd)
+
+    # Derive detected language from reconciliation records if available
+    detected_language = None
+    if pipeline_audit:
+        recon_data = safe_read_json(str(sd / "reconciliation" / "reconciliation_result.json"))
+        if recon_data:
+            for rec in recon_data.get("records", []):
+                lang = rec.get("language")
+                if lang:
+                    detected_language = lang
+                    break
+
     return {
         "session_id": session_id,
         "state": state,
@@ -967,18 +1153,22 @@ async def get_session_detail(session_id: str, token: str = Depends(require_auth)
         "mode": meta.get("mode", "stream"),
         "language": meta.get("language", "auto"),
         "speaker_count": meta.get("speaker_count"),
-        "diarization_enabled": meta.get("run_diarization", False),
+        "diarization_enabled": bool(diarization.get("requested")),
+        "diarization": diarization,
         "chunk_count": len(meta.get("chunks", [])),
         "model_size": meta.get("model_size", "auto"),
         "audio_duration_s": meta.get("audio_duration_s"),
         "transcript_coverage_ratio": None,
-        "detected_language": None,
+        "detected_language": detected_language,
         "transcript_present": _has_transcript(sd),
         "provisional_partial_available": (sd / "partial_transcript.json").is_file(),
         "stabilized_partial_available": (sd / "current" / "stabilized_partial.json").is_file() or (sd / "stabilized_partial.json").is_file(),
         "final_transcript_available": (sd / "current" / "final_transcript.json").is_file() or (sd / "final_transcript.json").is_file(),
         "active_override": None,
         "error": error_msg,
+        "quality_gate": quality_gate,
+        "context_span_count": (context_spans_payload or {}).get("span_count", 0),
+        "pipeline_audit": pipeline_audit,
     }
 
 
@@ -1189,8 +1379,13 @@ def _enqueue_job(session_id: str, meta: dict, body: dict):
         logger.error(f"Failed to enqueue job: {e}")
 
 
-def _maybe_trigger_partial(session_id: str, chunk_count: int, meta: dict):
-    """Maybe enqueue a partial transcription job."""
+def _maybe_trigger_live_canonical(session_id: str, chunk_count: int, meta: dict):
+    """Maybe enqueue an incremental canonical live job.
+
+    We reuse the existing cadence/cooldown config that used to drive the fake
+    partial preview path, but the queued work is now the real lexical canonical
+    pipeline up through canonical assembly.
+    """
     cfg = get_config()
     every_n = cfg.worker.partial_every_n_chunks
     if every_n <= 0:
@@ -1200,7 +1395,7 @@ def _maybe_trigger_partial(session_id: str, chunk_count: int, meta: dict):
 
     # Cooldown check
     cooldown = cfg.worker.partial_cooldown_seconds
-    last_trigger = meta.get("last_partial_trigger_at")
+    last_trigger = meta.get("last_live_trigger_at")
     if last_trigger and cooldown > 0:
         try:
             last_dt = datetime.fromisoformat(last_trigger.replace("Z", "+00:00"))
@@ -1212,7 +1407,7 @@ def _maybe_trigger_partial(session_id: str, chunk_count: int, meta: dict):
 
     # Check lock
     sd = session_dir(session_id)
-    lock = sd / "partial_pending"
+    lock = sd / "live_canonical_pending"
     if lock.exists():
         return
 
@@ -1223,14 +1418,15 @@ def _maybe_trigger_partial(session_id: str, chunk_count: int, meta: dict):
     try:
         lock.touch()
         r.rpush(cfg.redis.partial_queue, json.dumps({
-            "job_type": "v2_partial",
+            "job_type": "v2_canonical_live",
             "session_id": session_id,
         }))
         update_session_meta(session_id, {
-            "last_partial_trigger_at": datetime.now(timezone.utc).isoformat(),
+            "last_live_trigger_at": datetime.now(timezone.utc).isoformat(),
+            "last_live_trigger_chunk_count": chunk_count,
         })
     except Exception as e:
-        logger.warning(f"Partial trigger failed: {e}")
+        logger.warning(f"Canonical live trigger failed: {e}")
         try:
             lock.unlink()
         except OSError:
@@ -1286,6 +1482,134 @@ def _has_transcript(sd: Path) -> bool:
         if loc.is_file() and loc.stat().st_size > 0:
             return True
     return False
+
+
+def _build_pipeline_audit(sd: Path) -> Optional[dict]:
+    """Build a pipeline audit summary from on-disk run artifacts.
+
+    Returns None when no canonical pipeline run exists (legacy sessions).
+    """
+    # Find canonical run id
+    pointer = sd / "pipeline" / "canonical_run_id.txt"
+    if not pointer.is_file():
+        return None
+    run_id = pointer.read_text(encoding="utf-8").strip()
+    if not run_id:
+        return None
+
+    run_meta = safe_read_json(str(sd / "pipeline" / "runs" / run_id / "run_meta.json"))
+    if not run_meta:
+        return None
+
+    run_dir = sd / "pipeline" / "runs" / run_id
+
+    # --- Stage summary ---
+    stages_raw = run_meta.get("stages", {})
+    stages_audit = []
+    for name in run_meta.get("stage_names", []):
+        normalized_name = normalize_stage_name(name)
+        s = stages_raw.get(name, {}) or stages_raw.get(normalized_name, {})
+        entry = {
+            "name": normalized_name,
+            "legacy_name": name if name != normalized_name else None,
+            "status": s.get("status", "pending"),
+            "actual_model": s.get("actual_model"),
+            "routing_reason": s.get("routing_reason"),
+            "degraded": s.get("degraded", False),
+            "fallback": s.get("fallback", False),
+            "error": s.get("error"),
+            "started_at": s.get("started_at"),
+            "finished_at": s.get("finished_at"),
+        }
+        # Load routing detail if present
+        routing_file = None
+        if normalized_name == "first_pass_medium":
+            routing_file = "first_pass_routing.json"
+        elif normalized_name == "candidate_asr_large_v3":
+            routing_file = "candidate_a_routing.json"
+        elif normalized_name == "candidate_asr_secondary":
+            routing_file = "candidate_b_routing.json"
+        if routing_file:
+            routing = None
+            for stage_dir_name in stage_directory_candidates(normalized_name):
+                routing = safe_read_json(str(run_dir / "stages" / stage_dir_name / routing_file))
+                if routing:
+                    break
+            if routing:
+                entry["selected_model"] = routing.get("selected_model")
+                lang_ctx = routing.get("language_context", {})
+                entry["forced_language"] = lang_ctx.get("forced_language")
+                entry["transcription_mode"] = lang_ctx.get("transcription_mode")
+        stages_audit.append(entry)
+
+    # --- ASR summary ---
+    asr_summary = safe_read_json(str(sd / "candidates" / "asr_summary.json"))
+    asr_audit = None
+    if asr_summary:
+        by_model = asr_summary.get("candidates_by_model", {})
+        asr_audit = {
+            "models_attempted": asr_summary.get("model_ids", []),
+            "window_count": asr_summary.get("window_count", 0),
+            "total_candidates": asr_summary.get("candidate_count", 0),
+            "per_model": {
+                model_id: {
+                    "success": stats.get("success", 0),
+                    "failed": stats.get("failed", 0),
+                    "total": stats.get("count", 0),
+                }
+                for model_id, stats in by_model.items()
+            },
+        }
+
+    # --- Reconciliation summary ---
+    recon = safe_read_json(str(sd / "reconciliation" / "reconciliation_result.json"))
+    recon_audit = None
+    if recon:
+        recon_audit = {
+            "stripe_count": recon.get("stripe_count", 0),
+            "llm_resolved": recon.get("llm_resolved_count", 0),
+            "fallback_resolved": recon.get("fallback_resolved_count", 0),
+            "validation_rejected": recon.get("validation_rejected_count", 0),
+            "total_chosen_chars": recon.get("total_chosen_chars", 0),
+            "reconciler_status": recon.get("reconciler_status"),
+            "llm_available": recon.get("llm_available", False),
+        }
+
+    # --- Decode lattice summary ---
+    lattice = safe_read_json(str(sd / "windows" / "decode_windows.json"))
+    lattice_audit = None
+    if lattice:
+        lattice_audit = {
+            "total_windows": lattice.get("window_count", 0),
+            "scheduled_windows": lattice.get("scheduled_count", 0),
+            "bridge_windows": lattice.get("bridge_count", 0),
+            "geometry": lattice.get("geometry"),
+        }
+
+    # --- Triage summary ---
+    triage = safe_read_json(str(sd / "triage" / "triage_result.json"))
+    triage_audit = None
+    if triage:
+        triage_audit = {
+            "speech_ratio": triage.get("speech_ratio"),
+            "island_count": len(triage.get("speech_islands", [])),
+            "total_duration_ms": triage.get("total_duration_ms"),
+            "speech_duration_ms": triage.get("speech_duration_ms"),
+        }
+
+    return {
+        "run_id": run_id,
+        "run_status": run_meta.get("status"),
+        "run_type": run_meta.get("run_type", "canonical"),
+        "started_at": run_meta.get("started_at"),
+        "finished_at": run_meta.get("finished_at"),
+        "error": run_meta.get("error"),
+        "stages": stages_audit,
+        "asr": asr_audit,
+        "reconciliation": recon_audit,
+        "decode_lattice": lattice_audit,
+        "triage": triage_audit,
+    }
 
 
 def _has_any_transcript_file(d: Path) -> bool:

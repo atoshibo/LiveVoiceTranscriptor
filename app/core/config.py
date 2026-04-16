@@ -156,16 +156,31 @@ class WorkerConfig:
     partial_every_n_chunks: int = 5
     partial_cooldown_seconds: int = 120
     max_chunk_mb: int = 30
+    max_file_upload_mb: int = 512
     max_session_chunks: int = 500
     strict_cuda: bool = False
+    # GPU runtime configuration
+    whisper_device: str = "cuda"
+    whisper_compute_type: str = "float16"
+    whisper_compute_type_fallbacks: list = field(default_factory=list)
+    cuda_device_index: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "concurrency", _env_int("WORKER_CONCURRENCY", 1))
         object.__setattr__(self, "partial_every_n_chunks", _env_int("PARTIAL_EVERY_N_CHUNKS", 5))
         object.__setattr__(self, "partial_cooldown_seconds", _env_int("PARTIAL_COOLDOWN_SECONDS", 120))
         object.__setattr__(self, "max_chunk_mb", _env_int("MAX_CHUNK_MB", 30))
+        object.__setattr__(self, "max_file_upload_mb", _env_int("MAX_FILE_UPLOAD_MB", 512))
         object.__setattr__(self, "max_session_chunks", _env_int("MAX_SESSION_CHUNKS", 500))
-        object.__setattr__(self, "strict_cuda", _env_bool("STRICT_CUDA", False))
+        # STRICT_CUDA / WHISPER_STRICT_CUDA — canonical name is WHISPER_STRICT_CUDA
+        strict = _env_bool("WHISPER_STRICT_CUDA", False) or _env_bool("STRICT_CUDA", False)
+        object.__setattr__(self, "strict_cuda", strict)
+        object.__setattr__(self, "whisper_device", _env("WHISPER_DEVICE", "cuda"))
+        object.__setattr__(self, "whisper_compute_type", _env("WHISPER_COMPUTE_TYPE", "float16"))
+        fallbacks_raw = _env("WHISPER_COMPUTE_TYPE_FALLBACKS", "int8_float16,int8")
+        fallbacks = [f.strip() for f in fallbacks_raw.split(",") if f.strip()]
+        object.__setattr__(self, "whisper_compute_type_fallbacks", fallbacks)
+        object.__setattr__(self, "cuda_device_index", _env_int("CUDA_DEVICE_INDEX", 0))
 
 
 @dataclass(frozen=True)
